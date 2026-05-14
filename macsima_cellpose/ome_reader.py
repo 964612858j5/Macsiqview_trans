@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -85,35 +86,20 @@ def parse_channel_override(override: str | None, names: list[str], channel_count
 
 
 class OmeTileReader:
-    """Read a selected channel from OME-TIFF tiles without loading all channels when possible."""
+    """Read selected-channel OME-TIFF tiles using tifffile's lazy zarr interface."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, logger: logging.Logger | None = None) -> None:
         self.path = path
-        self._tif = tifffile.TiffFile(path)
-        self.series = self._tif.series[0]
-        self.axes = self.series.axes
-        self.shape = self.series.shape
-        self._store: Any | None = None
-        self._array: Any | None = None
-        try:
-            import zarr
-
-            self._store = self.series.aszarr()
-            self._array = zarr.open(self._store, mode="r")
-        except Exception:
-            self._array = None
-        self.height, self.width = self._infer_hw()
+        self.logger = logger or logging.getLogger(__name__)
+        self.channel_names = ome_channel_names(path)
+        self.height, self.width = self._parse_image_size()
+        self.z0_shape, self.z0_ndim = self._inspect_zarr()
         self.channel_count = self._infer_channel_count()
 
     def close(self) -> None:
-        """Close open TIFF resources."""
+        """Compatibility no-op. TIFF and zarr stores are opened per read call."""
 
-        if self._store is not None:
-            try:
-                self._store.close()
-            except Exception:
-                pass
-        self._tif.close()
+        return None
 
     def __enter__(self) -> "OmeTileReader":
         return self
@@ -121,35 +107,122 @@ class OmeTileReader:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
-    def _infer_hw(self) -> tuple[int, int]:
-        if "Y" not in self.axes or "X" not in self.axes:
-            raise ValueError(f"OME-TIFF series does not expose Y and X axes: axes={self.axes}")
-        return int(self.shape[self.axes.index("Y")]), int(self.shape[self.axes.index("X")])
+    def _parse_image_size(self) -> tuple[int, int]:
+        """Use page 0 dimensions as the full image size, matching the proven MACSima loader."""
+
+        with tifffile.TiffFile(self.path) as tif:
+            page0 = tif.pages[0]
+            return int(page0.imagelength), int(page0.imagewidth)
+
+    @staticmethod
+    def _select_z0(z: Any) -> Any:
+        """Select the first array from a tifffile zarr object or group."""
+
+        if hasattr(z, "ndim"):
+            return z
+        if not hasattr(z, "keys"):
+            return z
+        keys = list(z.keys())
+        if "0" in keys:
+            try:
+                return z[0]
+            except Exception:
+                return z["0"]
+        try:
+            return next(iter(z.values()))
+        except Exception as exc:
+            raise RuntimeError("Could not select an array from the OME-TIFF zarr group.") from exc
+
+    def _open_z0(self) -> tuple[Any, Any, Any]:
+        """Open a fresh TiffFile and zarr array for one ROI read."""
+
+        import zarr
+
+        tif = tifffile.TiffFile(self.path)
+        try:
+            store = tif.aszarr()
+            z = zarr.open(store, mode="r")
+            z0 = self._select_z0(z)
+            self.logger.debug("OME zarr object type: %s", type(z).__name__)
+            self.logger.debug("OME selected z0 shape: %s", getattr(z0, "shape", None))
+            self.logger.debug("OME selected z0 ndim: %s", getattr(z0, "ndim", None))
+            return tif, store, z0
+        except Exception:
+            tif.close()
+            raise
+
+    def _inspect_zarr(self) -> tuple[tuple[int, ...], int]:
+        """Inspect zarr shape without caching the zarr object."""
+
+        tif = None
+        store = None
+        try:
+            tif, store, z0 = self._open_z0()
+            shape = tuple(int(v) for v in getattr(z0, "shape", ()))
+            ndim = int(getattr(z0, "ndim", 0))
+            return shape, ndim
+        except Exception as exc:
+            raise RuntimeError(f"OME-TIFF zarr inspection failed: {exc}") from exc
+        finally:
+            if store is not None and hasattr(store, "close"):
+                try:
+                    store.close()
+                except Exception:
+                    pass
+            if tif is not None:
+                tif.close()
 
     def _infer_channel_count(self) -> int:
-        return int(self.shape[self.axes.index("C")]) if "C" in self.axes else 1
+        if self.z0_ndim == 3 and self.z0_shape:
+            return int(self.z0_shape[0])
+        if self.z0_ndim == 4 and len(self.z0_shape) >= 2:
+            return int(self.z0_shape[1])
+        if self.z0_ndim == 2:
+            return 1
+        if self.channel_names:
+            return len(self.channel_names)
+        raise RuntimeError(f"Unsupported OME-TIFF zarr dimensions during channel inference: ndim={self.z0_ndim}")
 
     def read_channel_tile(self, channel_index: int, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         """Read one 2-D tile from the selected channel."""
 
         if channel_index < 0 or channel_index >= self.channel_count:
             raise ValueError(f"Channel index is out of range: {channel_index}")
-        index: list[Any] = []
-        for axis in self.axes:
-            if axis == "Y":
-                index.append(slice(y0, y1))
-            elif axis == "X":
-                index.append(slice(x0, x1))
-            elif axis == "C":
-                index.append(channel_index)
+        self.logger.debug(
+            "Reading OME tile: channel_index=%d y0=%d y1=%d x0=%d x1=%d",
+            channel_index,
+            y0,
+            y1,
+            x0,
+            x1,
+        )
+        tif = None
+        store = None
+        try:
+            tif, store, z0 = self._open_z0()
+            ndim = int(getattr(z0, "ndim", 0))
+            if ndim == 3:
+                tile = np.asarray(z0[channel_index, y0:y1, x0:x1])
+            elif ndim == 4:
+                tile = np.asarray(z0[0, channel_index, y0:y1, x0:x1])
+            elif ndim == 2:
+                tile = np.asarray(z0[y0:y1, x0:x1])
             else:
-                index.append(0)
-        if self._array is not None:
-            tile = np.asarray(self._array[tuple(index)])
-        else:
-            data = self.series.asarray()
-            tile = np.asarray(data[tuple(index)])
-        return np.squeeze(tile)
+                raise RuntimeError(f"Unsupported OME-TIFF zarr dimensions for ROI read: ndim={ndim}")
+            return np.squeeze(tile).copy()
+        except Exception as exc:
+            raise RuntimeError(
+                "OME-TIFF zarr ROI read failed "
+                f"for channel_index={channel_index}, y={y0}:{y1}, x={x0}:{x1}: {exc}"
+            ) from exc
+        finally:
+            if store is not None and hasattr(store, "close"):
+                try:
+                    store.close()
+                except Exception:
+                    pass
+            if tif is not None:
+                tif.close()
 
 
 def choose_nuclear_channel(path: Path, markers_csv: Path | None, override: str | None, channel_count: int) -> tuple[int, list[str], bool]:

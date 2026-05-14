@@ -87,7 +87,7 @@ def process_sample(
             logger.info("Output label mask: %s", sample.label_output)
             logger.info("Output MacsIQView mask: %s", sample.macsiqview_output)
             logger.info("Tile settings: tile_size=%d overlap=%d batch_size=1", attempt_tile_size, attempt_overlap)
-            with OmeTileReader(sample.input_tiff) as reader:
+            with OmeTileReader(sample.input_tiff, logger=logger) as reader:
                 channel_index, channel_names, fallback = choose_nuclear_channel(
                     sample.input_tiff, sample.markers_csv, nuclear_channel, reader.channel_count
                 )
