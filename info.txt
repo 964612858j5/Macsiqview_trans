@@ -1,0 +1,25 @@
+/sda1/Nadya/20260514_cellpose
+
+(fusion) discoball@Discoball:/mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged/20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R1_B1_ROI1_staged/1/rack-01-well-B01-roi-001-exp-2/background$ ls
+markers_bs.csv  rack-01-well-B01-roi-001-exp-2_backsub.ome.tif
+(fusion) discoball@Discoball:/mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged/20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R1_B1_ROI1_staged/1/rack-01-well-B01-roi-001-exp-2/background$ cd /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged
+(fusion) discoball@Discoball:/mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged$ ls
+20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R1_B1_ROI1_staged
+20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R1_B1_ROI2_staged
+20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R1_C1_ROI1_staged
+20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R1_C1_ROI2_staged
+20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R1_C1_ROI3_staged
+20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R2_A1_ROI1_staged
+20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R2_A1_ROI2_staged
+20260213_AGNTrautwein_Sarcoma_2026-02-13_09-55-18_R2_C1_ROI1_staged
+block01_fusion_gui_en1.py
+block01_fusion_gui_en.py
+cellpose_run.py
+feature_extraction
+segmentation
+(fusion) discoball@Discoball:/mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged$ cd /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged/segmentation
+(fusion) discoball@Discoball:/mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged/segmentation$ ls
+R1_B1_ROI1_MacsIQView.tif  R1_B1_ROI2_MacsIQView.tif
+R1_B1_ROI1.tiff            R1_B1_ROI2.tiff
+(fusion) discoball@Discoball:/mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged/segmentation$ 
+
