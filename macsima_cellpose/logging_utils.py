@@ -7,8 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 
-def setup_logging(log_dir: Path, log_level: str) -> tuple[logging.Logger, Path]:
-    """Create a timestamped batch log file and console logger."""
+def setup_logging(log_dir: Path, log_level: str, verbose_terminal: bool = False) -> tuple[logging.Logger, Path]:
+    """Create a timestamped batch log file and optional console logger."""
 
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -20,9 +20,10 @@ def setup_logging(log_dir: Path, log_level: str) -> tuple[logging.Logger, Path]:
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-    console_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    if verbose_terminal:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
     return logger, log_path

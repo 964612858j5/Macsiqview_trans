@@ -7,13 +7,17 @@ import numpy as np
 from .tiling import Tile
 
 
-def paste_owned_objects(global_mask: np.ndarray, tile_mask: np.ndarray, tile: Tile, next_label: int) -> int:
-    """Paste complete tile objects whose global centroid is inside the tile owned region."""
+OwnedObject = tuple[np.ndarray, np.ndarray]
+
+
+def select_owned_objects(tile_mask: np.ndarray, tile: Tile) -> tuple[int, list[OwnedObject]]:
+    """Return objects whose global centroid is inside the tile owned region."""
 
     labels = np.unique(tile_mask)
     labels = labels[labels != 0]
+    owned: list[OwnedObject] = []
     if labels.size == 0:
-        return next_label
+        return 0, owned
     for label in labels:
         yy, xx = np.nonzero(tile_mask == label)
         if yy.size == 0:
@@ -24,12 +28,15 @@ def paste_owned_objects(global_mask: np.ndarray, tile_mask: np.ndarray, tile: Ti
             continue
         global_y = yy + tile.read_y0
         global_x = xx + tile.read_x0
-        inside = (
-            (global_y >= 0)
-            & (global_y < global_mask.shape[0])
-            & (global_x >= 0)
-            & (global_x < global_mask.shape[1])
-        )
+        owned.append((global_y, global_x))
+    return int(labels.size), owned
+
+
+def write_owned_objects(global_mask: np.ndarray, owned_objects: list[OwnedObject], next_label: int) -> int:
+    """Write retained complete objects into the global label mask."""
+
+    for global_y, global_x in owned_objects:
+        inside = (global_y >= 0) & (global_y < global_mask.shape[0]) & (global_x >= 0) & (global_x < global_mask.shape[1])
         global_mask[global_y[inside], global_x[inside]] = next_label
         next_label += 1
     return next_label

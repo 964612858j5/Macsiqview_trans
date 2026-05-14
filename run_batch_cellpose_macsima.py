@@ -18,11 +18,11 @@ import tifffile
 from macsima_cellpose.discovery import Sample, discover_samples
 from macsima_cellpose.gpu_utils import empty_cuda_cache, is_cuda_oom, require_gpu
 from macsima_cellpose.logging_utils import setup_logging
-from macsima_cellpose.macsiqview import write_macsiqview_mask
+from macsima_cellpose.macsiqview import remove_label_touching_borders
 from macsima_cellpose.ome_reader import OmeTileReader, choose_nuclear_channel
-from macsima_cellpose.progress import ProgressUI, SampleStatus, format_seconds
-from macsima_cellpose.segmentation import NucleiSegmenter
-from macsima_cellpose.stitching import paste_owned_objects, sequential_relabel
+from macsima_cellpose.progress import ProgressContext, ProgressUI, SampleStatus, format_seconds
+from macsima_cellpose.segmentation import NucleiSegmenter, normalize_tile_for_cellpose
+from macsima_cellpose.stitching import select_owned_objects, sequential_relabel, write_owned_objects
 from macsima_cellpose.tiling import compute_grid, iter_tiles
 
 
@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlap", type=int, default=256, help="Overlap halo in pixels used for the first attempt.")
     parser.add_argument("--nuclear-channel", default=None, help="Nuclear channel override as zero-based index or channel name.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Console log level.")
+    parser.add_argument("--verbose-terminal", action="store_true", help="Print detailed log messages to the terminal.")
+    parser.add_argument("--no-dashboard", action="store_true", help="Disable the live dashboard and print simple status lines.")
     return parser
 
 
@@ -64,6 +66,35 @@ def fallback_sequence(tile_size: int, overlap: int) -> list[tuple[int, int]]:
     return sequence
 
 
+def log_tile_stage(
+    logger: logging.Logger,
+    stage: str,
+    sample_id: str,
+    tile_index: int,
+    total_tiles: int,
+    elapsed_seconds: float,
+    tile_shape: tuple[int, ...],
+    local_labels: int,
+    kept_labels: int,
+) -> None:
+    """Log a timed tile-stage event with consistent fields."""
+
+    logger.info(
+        (
+            "%s | sample_id=%s tile=%d/%d elapsed_seconds=%.3f "
+            "tile_shape=%s local_labels=%d kept_labels=%d"
+        ),
+        stage,
+        sample_id,
+        tile_index,
+        total_tiles,
+        elapsed_seconds,
+        tile_shape,
+        local_labels,
+        kept_labels,
+    )
+
+
 def process_sample(
     sample: Sample,
     segmenter: NucleiSegmenter,
@@ -72,11 +103,16 @@ def process_sample(
     overwrite: bool,
     nuclear_channel: str | None,
     logger: logging.Logger,
+    status: SampleStatus,
+    ui: ProgressUI,
 ) -> str:
     """Process one sample with OOM fallback."""
 
     if sample.label_output.exists() and sample.macsiqview_output.exists() and not overwrite:
         logger.info("Skipping sample %s because outputs already exist.", sample.sample_id)
+        status.tile_current = 0
+        status.tile_total = 0
+        ui.refresh()
         return "skipped"
     sample.label_output.parent.mkdir(parents=True, exist_ok=True)
     last_error: BaseException | None = None
@@ -99,11 +135,17 @@ def process_sample(
                 height, width = reader.height, reader.width
                 n_rows, n_cols = compute_grid(height, width, attempt_tile_size, attempt_overlap)
                 logger.info("Image size: height=%d width=%d", height, width)
+                logger.info("OME zarr shape: %s", reader.z0_shape)
+                logger.info("OME zarr ndim: %d", reader.z0_ndim)
                 logger.info("Computed grid: n_rows=%d n_cols=%d", n_rows, n_cols)
                 global_mask = np.zeros((height, width), dtype=np.uint32)
                 next_label = 1
                 tiles = iter_tiles(height, width, attempt_tile_size, attempt_overlap)
+                status.tile_current = 0
+                status.tile_total = len(tiles)
+                ui.refresh()
                 for idx, tile in enumerate(tiles, start=1):
+                    expected_shape = (tile.read_y1 - tile.read_y0, tile.read_x1 - tile.read_x0)
                     logger.info(
                         "Tile %d/%d row=%d col=%d own=(%d:%d,%d:%d) read=(%d:%d,%d:%d)",
                         idx,
@@ -119,17 +161,143 @@ def process_sample(
                         tile.read_x0,
                         tile.read_x1,
                     )
+                    stage_started = time.time()
+                    log_tile_stage(logger, "read tile start", sample.sample_id, idx, len(tiles), 0.0, expected_shape, 0, 0)
                     tile_image = reader.read_channel_tile(channel_index, tile.read_y0, tile.read_y1, tile.read_x0, tile.read_x1)
-                    tile_mask = segmenter.segment_tile(tile_image)
-                    next_label = paste_owned_objects(global_mask, tile_mask, tile, next_label)
-                    del tile_image, tile_mask
+                    tile_shape = tuple(int(v) for v in tile_image.shape)
+                    log_tile_stage(
+                        logger,
+                        "read tile end",
+                        sample.sample_id,
+                        idx,
+                        len(tiles),
+                        time.time() - stage_started,
+                        tile_shape,
+                        0,
+                        0,
+                    )
+                    stage_started = time.time()
+                    log_tile_stage(logger, "normalize tile start", sample.sample_id, idx, len(tiles), 0.0, tile_shape, 0, 0)
+                    normalized_tile = normalize_tile_for_cellpose(tile_image)
+                    normalized_shape = tuple(int(v) for v in normalized_tile.shape)
+                    log_tile_stage(
+                        logger,
+                        "normalize tile end",
+                        sample.sample_id,
+                        idx,
+                        len(tiles),
+                        time.time() - stage_started,
+                        normalized_shape,
+                        0,
+                        0,
+                    )
+                    stage_started = time.time()
+                    log_tile_stage(logger, "Cellpose eval start", sample.sample_id, idx, len(tiles), 0.0, normalized_shape, 0, 0)
+                    tile_mask = segmenter.segment_tile(normalized_tile)
+                    local_labels = max(0, int(np.unique(tile_mask).size) - 1)
+                    log_tile_stage(
+                        logger,
+                        "Cellpose eval end",
+                        sample.sample_id,
+                        idx,
+                        len(tiles),
+                        time.time() - stage_started,
+                        tuple(int(v) for v in tile_mask.shape),
+                        local_labels,
+                        0,
+                    )
+                    stage_started = time.time()
+                    log_tile_stage(
+                        logger,
+                        "centroid ownership filtering start",
+                        sample.sample_id,
+                        idx,
+                        len(tiles),
+                        0.0,
+                        tuple(int(v) for v in tile_mask.shape),
+                        local_labels,
+                        0,
+                    )
+                    local_labels, owned_objects = select_owned_objects(tile_mask, tile)
+                    kept_labels = len(owned_objects)
+                    log_tile_stage(
+                        logger,
+                        "centroid ownership filtering end",
+                        sample.sample_id,
+                        idx,
+                        len(tiles),
+                        time.time() - stage_started,
+                        tuple(int(v) for v in tile_mask.shape),
+                        local_labels,
+                        kept_labels,
+                    )
+                    stage_started = time.time()
+                    log_tile_stage(
+                        logger,
+                        "writing kept labels to global mask start",
+                        sample.sample_id,
+                        idx,
+                        len(tiles),
+                        0.0,
+                        tuple(int(v) for v in tile_mask.shape),
+                        local_labels,
+                        kept_labels,
+                    )
+                    next_label = write_owned_objects(global_mask, owned_objects, next_label)
+                    log_tile_stage(
+                        logger,
+                        "writing kept labels to global mask end",
+                        sample.sample_id,
+                        idx,
+                        len(tiles),
+                        time.time() - stage_started,
+                        tuple(int(v) for v in tile_mask.shape),
+                        local_labels,
+                        kept_labels,
+                    )
+                    status.tile_current = idx
+                    ui.refresh()
+                    del tile_image, normalized_tile, tile_mask, owned_objects
                     empty_cuda_cache()
                     gc.collect()
+                logger.info("All tiles completed | sample_id=%s total_tiles=%d", sample.sample_id, len(tiles))
+                stage_started = time.time()
+                logger.info("Global relabel start | sample_id=%s labels_before=%d", sample.sample_id, max(0, next_label - 1))
                 final_mask = sequential_relabel(global_mask)
+                logger.info(
+                    "Global relabel end | sample_id=%s elapsed_seconds=%.3f labels_after=%d",
+                    sample.sample_id,
+                    time.time() - stage_started,
+                    int(final_mask.max()),
+                )
+                stage_started = time.time()
+                logger.info("Label TIFF write start | sample_id=%s output_path=%s", sample.sample_id, sample.label_output)
                 save_label_mask(sample.label_output, final_mask)
-                write_macsiqview_mask(final_mask, sample.macsiqview_output)
+                logger.info(
+                    "Label TIFF write end | sample_id=%s elapsed_seconds=%.3f output_path=%s",
+                    sample.sample_id,
+                    time.time() - stage_started,
+                    sample.label_output,
+                )
+                stage_started = time.time()
+                logger.info("MacsIQView conversion start | sample_id=%s", sample.sample_id)
+                macsiqview_mask = remove_label_touching_borders(final_mask)
+                logger.info(
+                    "MacsIQView conversion end | sample_id=%s elapsed_seconds=%.3f",
+                    sample.sample_id,
+                    time.time() - stage_started,
+                )
+                stage_started = time.time()
+                logger.info("MacsIQView TIFF write start | sample_id=%s output_path=%s", sample.sample_id, sample.macsiqview_output)
+                tifffile.imwrite(sample.macsiqview_output, macsiqview_mask, photometric="minisblack", compression="zlib")
+                logger.info(
+                    "MacsIQView TIFF write end | sample_id=%s elapsed_seconds=%.3f output_path=%s",
+                    sample.sample_id,
+                    time.time() - stage_started,
+                    sample.macsiqview_output,
+                )
                 logger.info("Completed sample %s with %d labels.", sample.sample_id, int(final_mask.max()))
-                del global_mask, final_mask
+                del global_mask, final_mask, macsiqview_mask
                 gc.collect()
                 empty_cuda_cache()
                 return "done"
@@ -150,7 +318,7 @@ def process_sample(
 def run(args: argparse.Namespace) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     project_dir = Path(__file__).resolve().parent
-    logger, log_path = setup_logging(project_dir / "logs", args.log_level)
+    logger, log_path = setup_logging(project_dir / "logs", args.log_level, verbose_terminal=args.verbose_terminal)
     logger.info("Log file: %s", log_path)
     logger.info("root_dir: %s", args.root_dir)
     logger.info("output_dir: %s", args.output_dir)
@@ -158,7 +326,8 @@ def run(args: argparse.Namespace) -> int:
     logger.info("Initial tile settings: tile_size=%d overlap=%d batch_size=1", args.tile_size, args.overlap)
     samples = discover_samples(args.root_dir, args.output_dir, args.only_sample)
     statuses = [SampleStatus(sample.sample_id, "pending", sample.label_output) for sample in samples]
-    ui = ProgressUI()
+    use_dashboard = not args.no_dashboard and not args.verbose_terminal
+    ui = ProgressUI(use_dashboard=use_dashboard)
     if args.dry_run:
         dry_rows = []
         for sample in samples:
@@ -179,7 +348,11 @@ def run(args: argparse.Namespace) -> int:
             status.started_at = datetime.now()
             status.finished_at = status.started_at
             status.error = str(exc)
-        ui.print_status(statuses, time.time() - started)
+        with ProgressContext(ui, statuses):
+            ui.refresh()
+        if args.no_dashboard or args.verbose_terminal or not ui.rich:
+            for status in statuses:
+                ui.print_line(ui.sample_line(status))
         logger.info("Batch completion summary")
         logger.info("total samples: %d", len(samples))
         logger.info("successful: 0")
@@ -200,27 +373,44 @@ def run(args: argparse.Namespace) -> int:
     successful = 0
     failed = 0
     skipped = 0
-    for sample, status in zip(samples, statuses):
-        status.status = "running"
-        status.started_at = datetime.now()
-        ui.print_status(statuses, time.time() - started)
-        try:
-            with ui.running_spinner(sample.sample_id):
-                result = process_sample(sample, segmenter, args.tile_size, args.overlap, args.overwrite, args.nuclear_channel, logger)
-            status.status = result
-            if result == "done":
-                successful += 1
-            elif result == "skipped":
-                skipped += 1
-        except Exception as exc:
-            failed += 1
-            status.status = "error"
-            status.error = str(exc)
-            logger.error("Sample %s marked as error: %s", sample.sample_id, exc)
-            logger.debug("Traceback:\n%s", traceback.format_exc())
-        finally:
-            status.finished_at = datetime.now()
-            ui.print_status(statuses, time.time() - started)
+    with ProgressContext(ui, statuses):
+        for sample, status in zip(samples, statuses):
+            status.status = "running"
+            status.started_at = datetime.now()
+            status.finished_at = None
+            status.tile_current = 0
+            status.tile_total = 0
+            ui.refresh()
+            if args.no_dashboard or args.verbose_terminal or not ui.rich:
+                ui.print_line(ui.sample_line(status))
+            try:
+                result = process_sample(
+                    sample,
+                    segmenter,
+                    args.tile_size,
+                    args.overlap,
+                    args.overwrite,
+                    args.nuclear_channel,
+                    logger,
+                    status,
+                    ui,
+                )
+                status.status = result
+                if result == "done":
+                    successful += 1
+                elif result == "skipped":
+                    skipped += 1
+            except Exception as exc:
+                failed += 1
+                status.status = "error"
+                status.error = str(exc)
+                logger.error("Sample %s marked as error: %s", sample.sample_id, exc)
+                logger.debug("Traceback:\n%s", traceback.format_exc())
+            finally:
+                status.finished_at = datetime.now()
+                ui.refresh()
+                if args.no_dashboard or args.verbose_terminal or not ui.rich:
+                    ui.print_line(ui.sample_line(status))
     total_runtime = time.time() - started
     logger.info("Batch completion summary")
     logger.info("total samples: %d", len(samples))
@@ -246,7 +436,8 @@ def main() -> int:
         return run(args)
     except Exception as exc:
         print(f"Fatal error: {exc}", file=sys.stderr)
-        traceback.print_exc()
+        if getattr(args, "verbose_terminal", False):
+            traceback.print_exc()
         return 2
 
 

@@ -27,6 +27,8 @@ python run_batch_cellpose_macsima.py \
   --overwrite
 ```
 
+By default, the terminal shows a clean one-line-per-sample status dashboard. Detailed tile, channel, timing, and traceback information is still written to the timestamped log file.
+
 ## Single Sample
 
 ```bash
@@ -108,3 +110,19 @@ logs/batch_cellpose_YYYYMMDD_HHMMSS.log
 ```
 
 Logs include paths, GPU information, Cellpose model settings, tile settings, retries, CUDA OOM events, timings, output paths, and traceback details.
+
+## Terminal Output
+
+Default terminal output uses a dynamic dashboard when `rich` is available. Each sample occupies one line with status, sample ID, completed tiles, total tiles, elapsed time, and estimated remaining time.
+
+Use detailed terminal logs only when needed:
+
+```bash
+python run_batch_cellpose_macsima.py --verbose-terminal
+```
+
+Disable the live dashboard and print simple line-by-line status:
+
+```bash
+python run_batch_cellpose_macsima.py --no-dashboard
+```
