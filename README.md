@@ -21,13 +21,13 @@ This project provides a production-oriented GPU batch segmentation pipeline for 
 python run_batch_cellpose_macsima.py \
   --root-dir /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged \
   --output-dir /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged/segmentation \
-  --tile-size 3072 \
   --overlap 256 \
   --gpu \
   --overwrite
 ```
 
 By default, the terminal shows a clean one-line-per-sample status dashboard. Detailed tile, channel, timing, and traceback information is still written to the timestamped log file.
+The default segmentation grid is the v7-compatible `--n-rows 2 --n-cols 3` layout, giving 6 tiles for each sample unless `--tile-size` is provided.
 
 ## Single Sample
 
@@ -35,7 +35,6 @@ By default, the terminal shows a clean one-line-per-sample status dashboard. Det
 python run_batch_cellpose_macsima.py \
   --root-dir /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged \
   --only-sample R1_B1_ROI1 \
-  --tile-size 3072 \
   --overlap 256 \
   --gpu \
   --overwrite
@@ -60,20 +59,23 @@ For each sample, the output directory receives:
 
 ## Tiling and Stitching
 
-The default tile settings are:
+The default v7-compatible tile settings are:
 
-- `tile_size = 3072`
+- `n_rows = 2`
+- `n_cols = 3`
 - `overlap_px = 256`
 - `batch_size = 1`
 
-The owned region size is `tile_size - 2 * overlap_px`. The grid is computed automatically:
+In default mode, the owned region grid follows Fusion_analysis v7:
 
 ```text
-n_cols = ceil(width / owned_region_size)
-n_rows = ceil(height / owned_region_size)
+tile_h = ceil(height / n_rows)
+tile_w = ceil(width / n_cols)
 ```
 
-Each owned region is expanded by the overlap halo for inference context. After Cellpose predicts labels on the expanded tile, each object's centroid is converted into global coordinates. The complete object is retained only if its centroid falls inside the tile owned region. Retained objects are written into the global mask and the final mask is sequentially relabeled.
+Each owned region is expanded by the overlap halo for inference context. After Cellpose predicts labels on the expanded tile, each object's centroid is checked in local tile coordinates. Complete objects are retained only if their centroid falls inside the tile owned region. Retained objects are remapped with a global label offset and streamed into a `uint32` memmap-backed global mask.
+
+If `--tile-size` is provided, the CLI computes a grid from `tile_size - 2 * overlap_px`.
 
 ## CUDA OOM Fallback
 

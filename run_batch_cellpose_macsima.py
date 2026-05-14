@@ -12,23 +12,16 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-import tifffile
-
 from macsima_cellpose.discovery import Sample, discover_samples
 from macsima_cellpose.gpu_utils import empty_cuda_cache, is_cuda_oom, require_gpu
 from macsima_cellpose.logging_utils import setup_logging
-from macsima_cellpose.macsiqview import remove_label_touching_borders
-from macsima_cellpose.ome_reader import OmeTileReader, choose_nuclear_channel
 from macsima_cellpose.progress import ProgressContext, ProgressUI, SampleStatus, format_seconds
-from macsima_cellpose.segmentation import NucleiSegmenter, normalize_tile_for_cellpose
-from macsima_cellpose.stitching import select_owned_objects, sequential_relabel, write_owned_objects
-from macsima_cellpose.tiling import compute_grid, iter_tiles
+from macsima_cellpose.v7_core import V7NucleiSegmenter, run_v7_like_segmentation
 
 
 DEFAULT_ROOT = Path("/mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged")
 DEFAULT_OUTPUT = DEFAULT_ROOT / "segmentation"
-OOM_FALLBACKS = ((3072, 256), (2048, 256), (1536, 192))
+OOM_FALLBACKS = ((4096, 256), (3072, 256), (2048, 256), (1536, 192))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,25 +32,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Discover samples and print planned processing without running Cellpose.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output masks.")
     parser.add_argument("--gpu", action="store_true", help="Require CUDA GPU execution. This tool never falls back to CPU.")
-    parser.add_argument("--tile-size", type=int, default=3072, help="Expanded tile size used for the first attempt.")
-    parser.add_argument("--overlap", type=int, default=256, help="Overlap halo in pixels used for the first attempt.")
+    parser.add_argument("--tile-size", type=int, default=None, help="Optional expanded tile size. Default uses the v7-compatible row and column grid.")
+    parser.add_argument("--n-rows", type=int, default=2, help="V7-compatible tile grid rows. Default is 2.")
+    parser.add_argument("--n-cols", type=int, default=3, help="V7-compatible tile grid columns. Default is 3.")
+    parser.add_argument("--overlap", type=int, default=256, help="Overlap halo in pixels.")
     parser.add_argument("--nuclear-channel", default=None, help="Nuclear channel override as zero-based index or channel name.")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Console log level.")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Console log level for --verbose-terminal.")
     parser.add_argument("--verbose-terminal", action="store_true", help="Print detailed log messages to the terminal.")
     parser.add_argument("--no-dashboard", action="store_true", help="Disable the live dashboard and print simple status lines.")
     return parser
 
 
-def save_label_mask(path: Path, mask: np.ndarray) -> None:
-    """Write full label mask as tiled TIFF."""
+def fallback_sequence(tile_size: int | None, overlap: int) -> list[tuple[int | None, int]]:
+    """Build OOM retry sequence while preserving v7 grid mode by default."""
 
-    tifffile.imwrite(path, mask.astype(np.uint32, copy=False), bigtiff=True, photometric="minisblack", compression="zlib")
-
-
-def fallback_sequence(tile_size: int, overlap: int) -> list[tuple[int, int]]:
-    """Build OOM retry sequence starting with CLI settings."""
-
-    sequence = [(tile_size, overlap)]
+    if tile_size is None:
+        return [(None, overlap)]
+    sequence: list[tuple[int | None, int]] = [(tile_size, overlap)]
     for fallback in OOM_FALLBACKS:
         if fallback[0] >= tile_size:
             continue
@@ -66,47 +57,20 @@ def fallback_sequence(tile_size: int, overlap: int) -> list[tuple[int, int]]:
     return sequence
 
 
-def log_tile_stage(
-    logger: logging.Logger,
-    stage: str,
-    sample_id: str,
-    tile_index: int,
-    total_tiles: int,
-    elapsed_seconds: float,
-    tile_shape: tuple[int, ...],
-    local_labels: int,
-    kept_labels: int,
-) -> None:
-    """Log a timed tile-stage event with consistent fields."""
-
-    logger.info(
-        (
-            "%s | sample_id=%s tile=%d/%d elapsed_seconds=%.3f "
-            "tile_shape=%s local_labels=%d kept_labels=%d"
-        ),
-        stage,
-        sample_id,
-        tile_index,
-        total_tiles,
-        elapsed_seconds,
-        tile_shape,
-        local_labels,
-        kept_labels,
-    )
-
-
 def process_sample(
     sample: Sample,
-    segmenter: NucleiSegmenter,
-    tile_size: int,
+    segmenter: V7NucleiSegmenter,
+    tile_size: int | None,
     overlap: int,
+    n_rows: int,
+    n_cols: int,
     overwrite: bool,
     nuclear_channel: str | None,
     logger: logging.Logger,
     status: SampleStatus,
     ui: ProgressUI,
 ) -> str:
-    """Process one sample with OOM fallback."""
+    """Process one sample with the v7-like fast core."""
 
     if sample.label_output.exists() and sample.macsiqview_output.exists() and not overwrite:
         logger.info("Skipping sample %s because outputs already exist.", sample.sample_id)
@@ -122,188 +86,47 @@ def process_sample(
             logger.info("Input TIFF: %s", sample.input_tiff)
             logger.info("Output label mask: %s", sample.label_output)
             logger.info("Output MacsIQView mask: %s", sample.macsiqview_output)
-            logger.info("Tile settings: tile_size=%d overlap=%d batch_size=1", attempt_tile_size, attempt_overlap)
-            with OmeTileReader(sample.input_tiff, logger=logger) as reader:
-                channel_index, channel_names, fallback = choose_nuclear_channel(
-                    sample.input_tiff, sample.markers_csv, nuclear_channel, reader.channel_count
-                )
-                if fallback:
-                    logger.warning("No nuclear channel was detected for sample %s. Falling back to channel 0.", sample.sample_id)
-                logger.info("Selected nuclear channel index: %d", channel_index)
-                if channel_index < len(channel_names):
-                    logger.info("Selected nuclear channel name: %s", channel_names[channel_index])
-                height, width = reader.height, reader.width
-                n_rows, n_cols = compute_grid(height, width, attempt_tile_size, attempt_overlap)
-                logger.info("Image size: height=%d width=%d", height, width)
-                logger.info("OME zarr shape: %s", reader.z0_shape)
-                logger.info("OME zarr ndim: %d", reader.z0_ndim)
-                logger.info("Computed grid: n_rows=%d n_cols=%d", n_rows, n_cols)
-                global_mask = np.zeros((height, width), dtype=np.uint32)
-                next_label = 1
-                tiles = iter_tiles(height, width, attempt_tile_size, attempt_overlap)
-                status.tile_current = 0
-                status.tile_total = len(tiles)
+            if attempt_tile_size:
+                logger.info("Tile settings: tile_size=%d overlap=%d batch_size=1", attempt_tile_size, attempt_overlap)
+            else:
+                logger.info("Tile settings: n_rows=%d n_cols=%d overlap=%d batch_size=1", n_rows, n_cols, attempt_overlap)
+
+            def update_progress(done_tiles: int, total_tiles: int) -> None:
+                status.tile_current = done_tiles
+                status.tile_total = total_tiles
                 ui.refresh()
-                for idx, tile in enumerate(tiles, start=1):
-                    expected_shape = (tile.read_y1 - tile.read_y0, tile.read_x1 - tile.read_x0)
-                    logger.info(
-                        "Tile %d/%d row=%d col=%d own=(%d:%d,%d:%d) read=(%d:%d,%d:%d)",
-                        idx,
-                        len(tiles),
-                        tile.row,
-                        tile.col,
-                        tile.own_y0,
-                        tile.own_y1,
-                        tile.own_x0,
-                        tile.own_x1,
-                        tile.read_y0,
-                        tile.read_y1,
-                        tile.read_x0,
-                        tile.read_x1,
-                    )
-                    stage_started = time.time()
-                    log_tile_stage(logger, "read tile start", sample.sample_id, idx, len(tiles), 0.0, expected_shape, 0, 0)
-                    tile_image = reader.read_channel_tile(channel_index, tile.read_y0, tile.read_y1, tile.read_x0, tile.read_x1)
-                    tile_shape = tuple(int(v) for v in tile_image.shape)
-                    log_tile_stage(
-                        logger,
-                        "read tile end",
-                        sample.sample_id,
-                        idx,
-                        len(tiles),
-                        time.time() - stage_started,
-                        tile_shape,
-                        0,
-                        0,
-                    )
-                    stage_started = time.time()
-                    log_tile_stage(logger, "normalize tile start", sample.sample_id, idx, len(tiles), 0.0, tile_shape, 0, 0)
-                    normalized_tile = normalize_tile_for_cellpose(tile_image)
-                    normalized_shape = tuple(int(v) for v in normalized_tile.shape)
-                    log_tile_stage(
-                        logger,
-                        "normalize tile end",
-                        sample.sample_id,
-                        idx,
-                        len(tiles),
-                        time.time() - stage_started,
-                        normalized_shape,
-                        0,
-                        0,
-                    )
-                    stage_started = time.time()
-                    log_tile_stage(logger, "Cellpose eval start", sample.sample_id, idx, len(tiles), 0.0, normalized_shape, 0, 0)
-                    tile_mask = segmenter.segment_tile(normalized_tile)
-                    local_labels = max(0, int(np.unique(tile_mask).size) - 1)
-                    log_tile_stage(
-                        logger,
-                        "Cellpose eval end",
-                        sample.sample_id,
-                        idx,
-                        len(tiles),
-                        time.time() - stage_started,
-                        tuple(int(v) for v in tile_mask.shape),
-                        local_labels,
-                        0,
-                    )
-                    stage_started = time.time()
-                    log_tile_stage(
-                        logger,
-                        "centroid ownership filtering start",
-                        sample.sample_id,
-                        idx,
-                        len(tiles),
-                        0.0,
-                        tuple(int(v) for v in tile_mask.shape),
-                        local_labels,
-                        0,
-                    )
-                    local_labels, owned_objects = select_owned_objects(tile_mask, tile)
-                    kept_labels = len(owned_objects)
-                    log_tile_stage(
-                        logger,
-                        "centroid ownership filtering end",
-                        sample.sample_id,
-                        idx,
-                        len(tiles),
-                        time.time() - stage_started,
-                        tuple(int(v) for v in tile_mask.shape),
-                        local_labels,
-                        kept_labels,
-                    )
-                    stage_started = time.time()
-                    log_tile_stage(
-                        logger,
-                        "writing kept labels to global mask start",
-                        sample.sample_id,
-                        idx,
-                        len(tiles),
-                        0.0,
-                        tuple(int(v) for v in tile_mask.shape),
-                        local_labels,
-                        kept_labels,
-                    )
-                    next_label = write_owned_objects(global_mask, owned_objects, next_label)
-                    log_tile_stage(
-                        logger,
-                        "writing kept labels to global mask end",
-                        sample.sample_id,
-                        idx,
-                        len(tiles),
-                        time.time() - stage_started,
-                        tuple(int(v) for v in tile_mask.shape),
-                        local_labels,
-                        kept_labels,
-                    )
-                    status.tile_current = idx
-                    ui.refresh()
-                    del tile_image, normalized_tile, tile_mask, owned_objects
-                    empty_cuda_cache()
-                    gc.collect()
-                logger.info("All tiles completed | sample_id=%s total_tiles=%d", sample.sample_id, len(tiles))
-                stage_started = time.time()
-                logger.info("Global relabel start | sample_id=%s labels_before=%d", sample.sample_id, max(0, next_label - 1))
-                final_mask = sequential_relabel(global_mask)
+
+            sample_started = time.time()
+            result = run_v7_like_segmentation(
+                sample_id=sample.sample_id,
+                input_tiff=sample.input_tiff,
+                markers_csv=sample.markers_csv,
+                label_output=sample.label_output,
+                macsiqview_output=sample.macsiqview_output,
+                segmenter=segmenter,
+                logger=logger,
+                progress_callback=update_progress,
+                n_rows=n_rows,
+                n_cols=n_cols,
+                tile_size=attempt_tile_size,
+                overlap_px=attempt_overlap,
+                nuclear_channel=nuclear_channel,
+            )
+            logger.info("Completed sample %s with %d labels.", sample.sample_id, result.total_labels)
+            logger.info("Sample total tiles: %d", result.total_tiles)
+            for tile_idx, tile_seconds in enumerate(result.tile_times, start=1):
                 logger.info(
-                    "Global relabel end | sample_id=%s elapsed_seconds=%.3f labels_after=%d",
+                    "Sample tile runtime | sample_id=%s tile=%d/%d elapsed_seconds=%.3f",
                     sample.sample_id,
-                    time.time() - stage_started,
-                    int(final_mask.max()),
+                    tile_idx,
+                    result.total_tiles,
+                    tile_seconds,
                 )
-                stage_started = time.time()
-                logger.info("Label TIFF write start | sample_id=%s output_path=%s", sample.sample_id, sample.label_output)
-                save_label_mask(sample.label_output, final_mask)
-                logger.info(
-                    "Label TIFF write end | sample_id=%s elapsed_seconds=%.3f output_path=%s",
-                    sample.sample_id,
-                    time.time() - stage_started,
-                    sample.label_output,
-                )
-                stage_started = time.time()
-                logger.info("MacsIQView conversion start | sample_id=%s", sample.sample_id)
-                macsiqview_mask = remove_label_touching_borders(final_mask)
-                logger.info(
-                    "MacsIQView conversion end | sample_id=%s elapsed_seconds=%.3f",
-                    sample.sample_id,
-                    time.time() - stage_started,
-                )
-                stage_started = time.time()
-                logger.info("MacsIQView TIFF write start | sample_id=%s output_path=%s", sample.sample_id, sample.macsiqview_output)
-                tifffile.imwrite(sample.macsiqview_output, macsiqview_mask, photometric="minisblack", compression="zlib")
-                logger.info(
-                    "MacsIQView TIFF write end | sample_id=%s elapsed_seconds=%.3f output_path=%s",
-                    sample.sample_id,
-                    time.time() - stage_started,
-                    sample.macsiqview_output,
-                )
-                logger.info("Completed sample %s with %d labels.", sample.sample_id, int(final_mask.max()))
-                del global_mask, final_mask, macsiqview_mask
-                gc.collect()
-                empty_cuda_cache()
-                return "done"
+            logger.info("Sample total runtime | sample_id=%s elapsed_seconds=%.3f", sample.sample_id, time.time() - sample_started)
+            return "done"
         except BaseException as exc:
             last_error = exc
-            logger.error("Sample %s failed with tile_size=%d overlap=%d: %s", sample.sample_id, attempt_tile_size, attempt_overlap, exc)
+            logger.error("Sample %s failed with tile_size=%s overlap=%d: %s", sample.sample_id, attempt_tile_size, attempt_overlap, exc)
             logger.debug("Traceback for sample %s:\n%s", sample.sample_id, traceback.format_exc())
             empty_cuda_cache()
             gc.collect()
@@ -323,7 +146,10 @@ def run(args: argparse.Namespace) -> int:
     logger.info("root_dir: %s", args.root_dir)
     logger.info("output_dir: %s", args.output_dir)
     logger.info("Cellpose model: nuclei")
-    logger.info("Initial tile settings: tile_size=%d overlap=%d batch_size=1", args.tile_size, args.overlap)
+    if args.tile_size:
+        logger.info("Initial tile settings: tile_size=%d overlap=%d batch_size=1", args.tile_size, args.overlap)
+    else:
+        logger.info("Initial tile settings: n_rows=%d n_cols=%d overlap=%d batch_size=1", args.n_rows, args.n_cols, args.overlap)
     samples = discover_samples(args.root_dir, args.output_dir, args.only_sample)
     statuses = [SampleStatus(sample.sample_id, "pending", sample.label_output) for sample in samples]
     use_dashboard = not args.no_dashboard and not args.verbose_terminal
@@ -331,7 +157,13 @@ def run(args: argparse.Namespace) -> int:
     if args.dry_run:
         dry_rows = []
         for sample in samples:
-            logger.info("Dry run sample %s input=%s label_output=%s macsiqview_output=%s", sample.sample_id, sample.input_tiff, sample.label_output, sample.macsiqview_output)
+            logger.info(
+                "Dry run sample %s input=%s label_output=%s macsiqview_output=%s",
+                sample.sample_id,
+                sample.input_tiff,
+                sample.label_output,
+                sample.macsiqview_output,
+            )
             dry_rows.append((sample.sample_id, sample.input_tiff, sample.label_output, sample.macsiqview_output))
         ui.print_dry_run(dry_rows)
         return 0
@@ -339,7 +171,10 @@ def run(args: argparse.Namespace) -> int:
         logger.warning("The --gpu flag was not provided. GPU execution is still required and CPU fallback is disabled.")
     started = time.time()
     try:
-        gpu_info = require_gpu(logger)
+        require_gpu(logger)
+        import torch
+
+        device = torch.device("cuda")
     except Exception as exc:
         logger.error("GPU validation failed: %s", exc)
         logger.debug("Traceback:\n%s", traceback.format_exc())
@@ -368,8 +203,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"total runtime: {format_seconds(time.time() - started)}")
         print(f"output directory: {args.output_dir}")
         return 1
-    logger.info("GPU requirement satisfied: %s", gpu_info)
-    segmenter = NucleiSegmenter(logger)
+
+    segmenter = V7NucleiSegmenter(device, logger)
     successful = 0
     failed = 0
     skipped = 0
@@ -389,6 +224,8 @@ def run(args: argparse.Namespace) -> int:
                     segmenter,
                     args.tile_size,
                     args.overlap,
+                    args.n_rows,
+                    args.n_cols,
                     args.overwrite,
                     args.nuclear_channel,
                     logger,
@@ -411,6 +248,7 @@ def run(args: argparse.Namespace) -> int:
                 ui.refresh()
                 if args.no_dashboard or args.verbose_terminal or not ui.rich:
                     ui.print_line(ui.sample_line(status))
+
     total_runtime = time.time() - started
     logger.info("Batch completion summary")
     logger.info("total samples: %d", len(samples))
