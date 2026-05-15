@@ -118,22 +118,13 @@ class ProgressUI:
 
         print(message)
 
-    def print_dry_run(self, rows: list[tuple[str, Path, Path, Path]]) -> None:
+    def print_dry_run(self, rows: list[tuple[str, Path, Path, Path, Path]]) -> None:
         """Print dry-run input and output paths."""
 
-        if self.rich and self.table_cls is not None:
-            table = self.table_cls(title="Dry run plan", show_lines=False)
-            table.add_column("sample_id", no_wrap=True)
-            table.add_column("input TIFF")
-            table.add_column("label output")
-            table.add_column("MacsIQView output")
-            for sample_id, input_tiff, label_output, macsiqview_output in rows:
-                table.add_row(sample_id, str(input_tiff), str(label_output), str(macsiqview_output))
-            self.console.print(table)
-            return
         print("Dry run plan")
-        for sample_id, input_tiff, label_output, macsiqview_output in rows:
-            print(f"{sample_id}\t{input_tiff}\t{label_output}\t{macsiqview_output}")
+        print("sample_id\tsample_dir\tinput_tif\toutput_label_path\toutput_macsiqview_path")
+        for sample_id, sample_dir, input_tiff, label_output, macsiqview_output in rows:
+            print(f"{sample_id}\t{sample_dir}\t{input_tiff}\t{label_output}\t{macsiqview_output}")
 
     def sample_line(self, status: SampleStatus) -> str:
         """Return one simple status line for non-dashboard mode."""

@@ -4,9 +4,10 @@ This project provides a production-oriented GPU batch segmentation pipeline for 
 
 ## Behavior
 
-- Discovers dataset folders under a root directory when their names start with `2026`.
-- Finds input files matching `1/rack-*/background/*_backsub.ome.tif`.
-- Parses sample IDs such as `R1_B1_ROI1` from dataset folder names.
+- Recursively discovers input files matching `*_backsub.ome.tif` under the root directory.
+- Accepts only TIFF files whose direct parent directory is named `background`.
+- Infers each sample directory from `sample_dir/1/rack-*/background/*_backsub.ome.tif`.
+- Parses sample IDs such as `R1_B1_ROI1` from dataset folder names when available, then falls back to rack metadata such as `B01_ROI001`, then to a sanitized sample folder name.
 - Writes outputs to the configured segmentation directory.
 - Requires CUDA GPU execution and never falls back to CPU.
 - Uses Cellpose nuclei with `diameter=None` and default Cellpose parameters.

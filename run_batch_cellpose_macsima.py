@@ -26,7 +26,7 @@ OOM_FALLBACKS = ((4096, 256), (3072, 256), (2048, 256), (1536, 192))
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Batch GPU Cellpose nuclei segmentation for MACSima OME-TIFF datasets.")
-    parser.add_argument("--root-dir", type=Path, default=DEFAULT_ROOT, help="Root directory containing 2026* sample folders.")
+    parser.add_argument("--root-dir", type=Path, default=DEFAULT_ROOT, help="Root directory containing MACSima sample folders.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT, help="Directory for segmentation outputs.")
     parser.add_argument("--only-sample", default=None, help="Process only one sample ID, for example R1_B1_ROI1.")
     parser.add_argument("--dry-run", action="store_true", help="Discover samples and print planned processing without running Cellpose.")
@@ -164,7 +164,7 @@ def run(args: argparse.Namespace) -> int:
                 sample.label_output,
                 sample.macsiqview_output,
             )
-            dry_rows.append((sample.sample_id, sample.input_tiff, sample.label_output, sample.macsiqview_output))
+            dry_rows.append((sample.sample_id, sample.dataset_dir, sample.input_tiff, sample.label_output, sample.macsiqview_output))
         ui.print_dry_run(dry_rows)
         return 0
     if not args.gpu:
