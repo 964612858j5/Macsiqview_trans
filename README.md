@@ -1,131 +1,136 @@
 # MACSima Batch Cellpose Nuclei Segmentation
 
-This project provides a production-oriented GPU batch segmentation pipeline for MACSima spatial proteomics OME-TIFF datasets. It runs Cellpose with the nuclei model only, processes samples serially, uses overlap tile inference, and stitches objects by centroid ownership.
+This project runs a MACSima/MacsiqView staged-data batch pipeline:
 
-## Behavior
+1. Discover `*/background/*_backsub.ome.tif`.
+2. Generate a Cellpose nuclei label mask.
+3. Convert the label mask to a MacsIQView-compatible binary mask.
 
-- Recursively discovers input files matching `*_backsub.ome.tif` under the root directory.
-- Accepts only TIFF files whose direct parent directory is named `background`.
-- Infers each sample directory from `sample_dir/1/rack-*/background/*_backsub.ome.tif`.
-- Parses sample IDs such as `R1_B1_ROI1` from dataset folder names when available, then falls back to rack metadata such as `B01_ROI001`, then to a sanitized sample folder name.
-- Writes outputs to the configured segmentation directory.
-- Requires CUDA GPU execution and never falls back to CPU.
-- Uses Cellpose nuclei with `diameter=None` and default Cellpose parameters.
-- Processes overlapped tiles sequentially to reduce CUDA memory pressure.
-- Keeps complete tile objects only when their global centroid falls inside the non-overlap owned region.
-- Writes a full uint32 label TIFF and a MacsIQView-compatible uint8 binary TIFF.
-- Continues batch processing after per-sample failures.
+## Input Discovery
 
-## Default Command
+The batch script treats each first-level folder under `--root` as one staged result folder. Folder names may contain spaces and do not need to start with `2026`, `EXP`, or any other fixed prefix.
 
-```bash
-python run_batch_cellpose_macsima.py \
-  --root-dir /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged \
-  --output-dir /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged/segmentation \
-  --overlap 256 \
-  --gpu \
-  --overwrite
+Valid inputs are discovered recursively with both conditions:
+
+- The direct parent directory is named `background`.
+- The filename ends with `_backsub.ome.tif`.
+
+The script does not use `pseudochannel.tif`, existing old masks, or `IO_output_cp_masks.png`.
+
+## Output Modes
+
+Default mode is centralized output:
+
+```text
+--output-mode centralized-output
+--central-output-dir /mnt/MACSimaDumpling/CRC_V2_ALL_MASKS
 ```
 
-By default, the terminal shows a clean one-line-per-sample status dashboard. Detailed tile, channel, timing, and traceback information is still written to the timestamped log file.
-The default segmentation grid is the v7-compatible `--n-rows 2 --n-cols 3` layout, giving 6 tiles for each sample unless `--tile-size` is provided.
+Each staged result folder receives its own subdirectory under the central output directory:
 
-## Single Sample
+```text
+<central_output_dir>/<result_folder_name>/
+  rack-01-well-A01-roi-002-exp-2_cellpose_nuclei_mask.tif
+  rack-01-well-A01-roi-002-exp-2_cellpose_nuclei_mask_MacsIQView.tif
+```
+
+Per-result-folder mode writes into a named folder inside each staged result folder:
+
+```text
+<result_folder>/Fusion/
+  rack-01-well-A01-roi-002-exp-2_cellpose_nuclei_mask.tif
+  rack-01-well-A01-roi-002-exp-2_cellpose_nuclei_mask_MacsIQView.tif
+```
+
+The folder name is controlled by `--result-output-folder-name`; default is `Fusion`.
+
+## Summary
+
+Summary files are written as:
+
+```text
+CRC_cellpose_nuclei_summary.csv
+CRC_cellpose_nuclei_summary.json
+```
+
+In centralized mode, the global summary is written to `--central-output-dir`. In per-result-folder mode, the global summary is written to `--root`. Completed runs also write per-result summary files in each final output directory.
+
+Summary statuses include `success`, `already_done`, `missing_background`, `missing_backsub_ome_tif`, `failed`, and `dry_run`.
+
+## Default CRC Run
+
+```bash
+cd /sda1/Nadya/20260514_cellpose
+
+python run_batch_cellpose_macsima.py \
+  --root /mnt/MACSimaDumpling/CRC_V2 \
+  --gpu
+```
+
+## Centralized Output
 
 ```bash
 python run_batch_cellpose_macsima.py \
-  --root-dir /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged \
-  --only-sample R1_B1_ROI1 \
-  --overlap 256 \
-  --gpu \
-  --overwrite
+  --root /mnt/MACSimaDumpling/CRC_V2 \
+  --output-mode centralized-output \
+  --central-output-dir /mnt/MACSimaDumpling/CRC_V2_ALL_MASKS \
+  --gpu
+```
+
+## Per-Result-Folder Output
+
+```bash
+python run_batch_cellpose_macsima.py \
+  --root /mnt/MACSimaDumpling/CRC_V2 \
+  --output-mode per-result-folder \
+  --result-output-folder-name Fusion \
+  --gpu
 ```
 
 ## Dry Run
 
 ```bash
 python run_batch_cellpose_macsima.py \
-  --root-dir /mnt/MACSimaDumpling/NTrautwein_Sarcoma_staged \
+  --root /mnt/MACSimaDumpling/CRC_V2 \
   --dry-run
 ```
 
-Dry run mode discovers samples and prints input and output paths without running Cellpose.
+## Overwrite Existing Masks
 
-## Outputs
+The skip check uses the final MacsIQView mask. If `*_cellpose_nuclei_mask_MacsIQView.tif` exists, the task is marked `already_done` unless `--overwrite` is provided.
 
-For each sample, the output directory receives:
-
-- `{sample_id}.tiff`: full nuclei label mask.
-- `{sample_id}_MacsIQView.tif`: MacsIQView-compatible binary mask.
-
-## Tiling and Stitching
-
-The default v7-compatible tile settings are:
-
-- `n_rows = 2`
-- `n_cols = 3`
-- `overlap_px = 256`
-- `batch_size = 1`
-
-In default mode, the owned region grid follows Fusion_analysis v7:
-
-```text
-tile_h = ceil(height / n_rows)
-tile_w = ceil(width / n_cols)
+```bash
+python run_batch_cellpose_macsima.py \
+  --root /mnt/MACSimaDumpling/CRC_V2 \
+  --model-type nuclei \
+  --gpu \
+  --overwrite
 ```
-
-Each owned region is expanded by the overlap halo for inference context. After Cellpose predicts labels on the expanded tile, each object's centroid is checked in local tile coordinates. Complete objects are retained only if their centroid falls inside the tile owned region. Retained objects are remapped with a global label offset and streamed into a `uint32` memmap-backed global mask.
-
-If `--tile-size` is provided, the CLI computes a grid from `tile_size - 2 * overlap_px`.
-
-## CUDA OOM Fallback
-
-If CUDA out-of-memory occurs for a sample, the same sample is retried with:
-
-1. `tile_size=2048`, `overlap=256`
-2. `tile_size=1536`, `overlap=192`
-
-If all attempts fail, the sample is marked as error and the batch continues.
 
 ## Channel Selection
 
-The pipeline automatically searches OME metadata and `markers_bs.csv` for nuclear channels using these keywords:
+The pipeline searches OME metadata and `markers_bs.csv` for nuclear channel names using keywords such as `DAPI`, `Hoechst`, `DNA`, `nucleus`, and `nuclei`.
 
-- `DAPI`
-- `Hoechst`
-- `DNA`
-- `nucleus`
-- `nuclei`
-
-If no nuclear channel is detected, channel 0 is used and a warning is logged. A channel can be forced with:
+By default, if no nuclear channel is detected, that task is marked `failed` and the batch continues. Override the channel when needed:
 
 ```bash
---nuclear-channel 0
---nuclear-channel DAPI
+python run_batch_cellpose_macsima.py \
+  --root /mnt/MACSimaDumpling/CRC_V2 \
+  --gpu \
+  --nuclear-channel DAPI
 ```
 
-## Logs
-
-Every run writes a timestamped log file under `logs/`:
-
-```text
-logs/batch_cellpose_YYYYMMDD_HHMMSS.log
-```
-
-Logs include paths, GPU information, Cellpose model settings, tile settings, retries, CUDA OOM events, timings, output paths, and traceback details.
-
-## Terminal Output
-
-Default terminal output uses a dynamic dashboard when `rich` is available. Each sample occupies one line with status, sample ID, completed tiles, total tiles, elapsed time, and estimated remaining time.
-
-Use detailed terminal logs only when needed:
+For legacy behavior, allow channel 0 fallback:
 
 ```bash
-python run_batch_cellpose_macsima.py --verbose-terminal
+python run_batch_cellpose_macsima.py \
+  --root /mnt/MACSimaDumpling/CRC_V2 \
+  --gpu \
+  --allow-channel-zero-fallback
 ```
 
-Disable the live dashboard and print simple line-by-line status:
+## Parallelism
 
-```bash
-python run_batch_cellpose_macsima.py --no-dashboard
-```
+- CPU mode uses `--workers`.
+- GPU mode limits concurrent Cellpose tasks with `--gpu-workers`; the default is `1` to avoid CUDA OOM.
+- Per-task tile processing remains sequential and uses overlap stitching from the existing v7-like core.

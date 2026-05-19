@@ -56,6 +56,19 @@ def save_image(output_path, image_array):
     """Save image array as TIFF using tifffile."""
     tifffile.imwrite(output_path, image_array.astype(np.uint8), compression = True)
 
+def convert_label_mask_to_macsiqview(input_mask_path, output_mask_path):
+    """Convert a labeled nuclei mask into a MacsIQView-compatible binary mask."""
+    input_mask_path = pathlib.Path(input_mask_path)
+    output_mask_path = pathlib.Path(output_mask_path)
+    if not input_mask_path.is_file():
+        raise FileNotFoundError(f"Input mask not found: {input_mask_path}")
+    output_mask_path.parent.mkdir(parents=True, exist_ok=True)
+    img = load_image(input_mask_path)
+    mask = separation_border_inplace(img.copy())
+    mask[mask != 0] = 1
+    save_image(output_mask_path, mask)
+    return output_mask_path
+
 def main():
     parser = argparse.ArgumentParser(
         description="Apply separation border processing to images or directory of images."
@@ -89,15 +102,8 @@ def main():
             raise FileNotFoundError(f"Input file not found: {input_path}")
         
         print(f"Processing: {input_path}")
-        img = load_image(input_path)
-        print(f"Input shape: {img.shape}, unique values: {np.unique(img)}")
-        
-        mask = separation_border_inplace(img.copy())
-        mask[mask != 0] = 1
-        print(f"Output unique values: {np.unique(mask)}")
-        
         output_path = output_dir / f"{input_path.stem}_MacsIQView.tif"
-        save_image(output_path, mask)
+        convert_label_mask_to_macsiqview(input_path, output_path)
         print(f"Saved: {output_path}")
         
     else:
@@ -117,15 +123,8 @@ def main():
         
         for img_path in image_files:
             print(f"\nProcessing: {img_path}")
-            img = load_image(img_path)
-            print(f"Input shape: {img.shape}, unique values: {np.unique(img)}")
-            
-            mask = separation_border_inplace(img.copy())
-            mask[mask != 0] = 1
-            print(f"Output unique values: {np.unique(mask)}")
-            
             output_path = output_dir / f"{img_path.stem}_MacsIQView.tif"
-            save_image(output_path, mask)
+            convert_label_mask_to_macsiqview(img_path, output_path)
             print(f"Saved: {output_path}")
 
 if __name__ == "__main__":

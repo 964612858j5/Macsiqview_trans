@@ -35,7 +35,7 @@ class V7Result:
     total_labels: int
     tile_times: list[float]
     label_output: Path
-    macsiqview_output: Path
+    macsiqview_output: Path | None
 
 
 class FastOmeSource:
@@ -155,19 +155,52 @@ def centroids_vectorised(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 class V7NucleiSegmenter:
     """CellposeModel wrapper matching the Fusion_analysis v7 initialization style."""
 
-    def __init__(self, device: Any, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        device: Any,
+        logger: logging.Logger,
+        model_type: str = "nuclei",
+        diameter: float | None = 30.0,
+        cellprob_threshold: float = 0.0,
+        flow_threshold: float = 0.4,
+        gpu: bool = True,
+    ) -> None:
         from cellpose import models as cp_models
 
         self.logger = logger
-        self.model = cp_models.CellposeModel(device=device)
-        self.logger.info("Cellpose backend initialized with CellposeModel(device=%s).", device)
+        self.diameter = diameter
+        self.cellprob_threshold = cellprob_threshold
+        self.flow_threshold = flow_threshold
+        self.model_type = model_type
+        try:
+            self.model = cp_models.CellposeModel(gpu=gpu, model_type=model_type, device=device)
+        except TypeError:
+            try:
+                self.model = cp_models.CellposeModel(gpu=gpu, model_type=model_type)
+            except TypeError:
+                self.model = cp_models.CellposeModel(device=device)
+        self.logger.info(
+            "Cellpose backend initialized: model_type=%s device=%s gpu=%s diameter=%s cellprob_threshold=%.3f flow_threshold=%.3f",
+            model_type,
+            device,
+            gpu,
+            diameter,
+            cellprob_threshold,
+            flow_threshold,
+        )
 
     def segment_dapi_tile(self, tile_data: np.ndarray) -> np.ndarray:
         """Segment one DAPI tile using v7-style uint16 to float32 normalization."""
 
         tile_f32 = tile_data.astype(np.float32) / 65535.0
         dapi = np.ascontiguousarray(tile_f32)
-        result = self.model.eval(dapi, diameter=None, do_3D=False)
+        result = self.model.eval(
+            dapi,
+            diameter=self.diameter,
+            do_3D=False,
+            cellprob_threshold=self.cellprob_threshold,
+            flow_threshold=self.flow_threshold,
+        )
         masks = result[0] if isinstance(result, tuple) else result
         return np.asarray(masks, dtype=np.uint32)
 
@@ -207,7 +240,7 @@ def run_v7_like_segmentation(
     input_tiff: Path,
     markers_csv: Path | None,
     label_output: Path,
-    macsiqview_output: Path,
+    macsiqview_output: Path | None,
     segmenter: V7NucleiSegmenter,
     logger: logging.Logger,
     progress_callback: Callable[[int, int], None],
@@ -216,6 +249,7 @@ def run_v7_like_segmentation(
     tile_size: int | None,
     overlap_px: int,
     nuclear_channel: str | None,
+    require_detected_nuclear_channel: bool = False,
 ) -> V7Result:
     """Run the v7-like fast core for one MACSima OME-TIFF sample."""
 
@@ -226,7 +260,13 @@ def run_v7_like_segmentation(
             input_tiff, markers_csv, nuclear_channel, source.channel_count
         )
         if fallback:
-            logger.warning("No nuclear channel was detected for sample %s. Falling back to channel 0.", sample_id)
+            message = (
+                f"No nuclear/DAPI channel was detected for sample {sample_id}. "
+                "Provide --nuclear-channel to override."
+            )
+            if require_detected_nuclear_channel:
+                raise RuntimeError(message)
+            logger.warning("%s Falling back to channel 0.", message)
         logger.info("Selected nuclear channel index: %d", channel_index)
         if channel_index < len(channel_names):
             logger.info("Selected nuclear channel name: %s", channel_names[channel_index])
@@ -350,14 +390,15 @@ def run_v7_like_segmentation(
             write_started = time.time()
             write_tiled_tiff(label_output, global_mask, np.uint32, compression="lzw")
             logger.info("Label TIFF write end | sample_id=%s elapsed_seconds=%.3f output_path=%s", sample_id, time.time() - write_started, label_output)
-            macs_started = time.time()
-            write_macsiqview_binary_from_labels(global_mask, macsiqview_output)
-            logger.info(
-                "MacsIQView binary write end | sample_id=%s elapsed_seconds=%.3f output_path=%s",
-                sample_id,
-                time.time() - macs_started,
-                macsiqview_output,
-            )
+            if macsiqview_output is not None:
+                macs_started = time.time()
+                write_macsiqview_binary_from_labels(global_mask, macsiqview_output)
+                logger.info(
+                    "MacsIQView binary write end | sample_id=%s elapsed_seconds=%.3f output_path=%s",
+                    sample_id,
+                    time.time() - macs_started,
+                    macsiqview_output,
+                )
             return V7Result(
                 total_tiles=len(tiles),
                 total_labels=global_id_offset,
