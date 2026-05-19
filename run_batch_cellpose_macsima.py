@@ -46,6 +46,7 @@ SUMMARY_FIELDS = (
     "conversion_only",
     "nuclei_mask_exists",
     "macsiqview_mask_exists",
+    "skipped_by_user",
     "status",
     "n_background_found",
     "n_backsub_found",
@@ -95,6 +96,7 @@ class SummaryRow:
     conversion_only: bool = False
     nuclei_mask_exists: bool = False
     macsiqview_mask_exists: bool = False
+    skipped_by_user: bool = False
     skipped_reason: str = ""
     error_message: str = ""
     start_time: str = ""
@@ -124,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RESULT_OUTPUT_FOLDER_NAME,
         help="Per-result-folder output directory name. Default: Fusion.",
     )
+    parser.add_argument("--skip-list", type=Path, default=None, help="Optional txt/csv file containing result folder names to skip.")
     parser.add_argument("--dry-run", action="store_true", help="Scan inputs and write summary without running Cellpose.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output masks.")
     parser.add_argument("--model-type", default="nuclei", help="Cellpose model type. Default: nuclei.")
@@ -146,6 +149,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 def iso_now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def load_skip_list(skip_list_path: Path | None) -> set[str]:
+    """Load result folder names to skip from a single-column txt/csv file."""
+
+    if skip_list_path is None:
+        return set()
+    if not skip_list_path.exists():
+        raise FileNotFoundError(f"Skip-list file does not exist: {skip_list_path}")
+    if not skip_list_path.is_file():
+        raise FileNotFoundError(f"Skip-list path is not a file: {skip_list_path}")
+    if skip_list_path.suffix.lower() not in {".txt", ".csv"}:
+        raise ValueError(f"Skip-list must be a .txt or .csv file: {skip_list_path}")
+
+    skip_set: set[str] = set()
+    with skip_list_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        for row in reader:
+            if not row:
+                continue
+            value = str(row[0]).strip()
+            if not value or value.startswith("#"):
+                continue
+            skip_set.add(value)
+    return skip_set
 
 
 def input_base_name(input_path: Path) -> str:
@@ -220,6 +248,7 @@ def discover_macsima_backsub_images(
     output_mode: str = "centralized-output",
     central_output_dir: Path | None = DEFAULT_CENTRAL_OUTPUT_DIR,
     result_output_folder_name: str = DEFAULT_RESULT_OUTPUT_FOLDER_NAME,
+    skip_set: set[str] | None = None,
 ) -> list[Task]:
     """Discover valid background backsub OME-TIFF tasks under staged result folders."""
 
@@ -228,6 +257,7 @@ def discover_macsima_backsub_images(
         output_mode,
         central_output_dir,
         result_output_folder_name,
+        skip_set or set(),
     )
     return tasks
 
@@ -237,6 +267,7 @@ def discover_macsima_backsub_images_with_status(
     output_mode: str,
     central_output_dir: Path | None,
     result_output_folder_name: str,
+    skip_set: set[str],
 ) -> tuple[list[Task], list[SummaryRow], int]:
     """Discover tasks plus per-folder missing-background and missing-input rows."""
 
@@ -259,6 +290,27 @@ def discover_macsima_backsub_images_with_status(
         output_root = final_output_dir if output_mode == "per-result-folder" else central_output_dir
         if output_root is None:
             raise ValueError("Could not resolve output root.")
+        if result_folder_path.name in skip_set:
+            missing_rows.append(
+                SummaryRow(
+                    result_folder=result_folder_path.name,
+                    result_folder_path=str(result_folder_path),
+                    background_path="",
+                    input_backsub_ome_tif="",
+                    output_mask="",
+                    output_mode=output_mode,
+                    output_root=str(output_root),
+                    final_output_dir=str(final_output_dir),
+                    nuclei_mask_path="",
+                    macsiqview_mask_path="",
+                    status="skipped_by_user",
+                    n_background_found=0,
+                    n_backsub_found=0,
+                    skipped_by_user=True,
+                    skipped_reason="in_skip_list",
+                )
+            )
+            continue
         background_paths = sorted(
             path for path in result_folder_path.rglob("background") if path.is_dir() and path.name == "background"
         )
@@ -371,6 +423,7 @@ def task_to_row(task: Task, status: str, skipped_reason: str = "", error_message
         conversion_only=pipeline_state == "run_conversion_only",
         nuclei_mask_exists=nuclei_exists,
         macsiqview_mask_exists=macsiqview_exists,
+        skipped_by_user=status == "skipped_by_user",
         skipped_reason=skipped_reason,
         error_message=error_message,
     )
@@ -539,6 +592,7 @@ def print_completion(total_result_folders: int, total_tasks: int, rows: list[Sum
     print(f"missing_backsub_ome_tif: {counts.get('missing_backsub_ome_tif', 0)}")
     print(f"inconsistent_state: {counts.get('inconsistent_state', 0)}")
     print(f"conversion_only: {sum(1 for row in rows if row.conversion_only)}")
+    print(f"skipped_by_user: {counts.get('skipped_by_user', 0)}")
     print(f"failed: {counts.get('failed', 0)}")
     print(f"dry_run: {counts.get('dry_run', 0)}")
     print(f"total runtime: {format_seconds(elapsed)}")
@@ -553,15 +607,19 @@ def run(args: argparse.Namespace) -> int:
     logger.info("Output mode: %s", args.output_mode)
     logger.info("Central output dir: %s", args.central_output_dir)
     logger.info("Result output folder name: %s", args.result_output_folder_name)
+    logger.info("Skip-list path: %s", args.skip_list)
     logger.info("Model type: %s", args.model_type)
     logger.info("Cellpose params: diameter=%s cellprob_threshold=%.3f flow_threshold=%.3f", args.diameter, args.cellprob_threshold, args.flow_threshold)
     logger.info("Execution: gpu=%s workers=%d gpu_workers=%d dry_run=%s overwrite=%s", args.gpu, args.workers, args.gpu_workers, args.dry_run, args.overwrite)
 
+    skip_set = load_skip_list(args.skip_list)
+    logger.info("Skip-list entries loaded: %d", len(skip_set))
     tasks, missing_rows, total_result_folders = discover_macsima_backsub_images_with_status(
         args.root,
         args.output_mode,
         args.central_output_dir,
         args.result_output_folder_name,
+        skip_set,
     )
     logger.info("Discovered result folders: %d", total_result_folders)
     logger.info("Discovered Cellpose tasks: %d", len(tasks))

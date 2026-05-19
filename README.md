@@ -95,6 +95,19 @@ python run_batch_cellpose_macsima.py \
   --dry-run
 ```
 
+## Skip List
+
+Use `--skip-list` to skip selected first-level staged result folders by folder name. The file may be `.txt` or `.csv`, has one column with no header, ignores blank lines and lines beginning with `#`, and strips surrounding whitespace.
+
+```bash
+python run_batch_cellpose_macsima.py \
+  --root /mnt/MACSimaDumpling/CRC_V2 \
+  --skip-list /mnt/MACSimaDumpling/CRC_V2/skip_samples.txt \
+  --gpu
+```
+
+Skipped folders are not scanned internally and are recorded in the summary as `skipped_by_user` with `skipped_reason=in_skip_list`.
+
 ## Overwrite Existing Masks
 
 The pipeline supports resume with four output states:
