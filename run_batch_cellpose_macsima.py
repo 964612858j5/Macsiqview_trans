@@ -9,7 +9,9 @@ import csv
 import gc
 import json
 import logging
+import shutil
 import sys
+import threading
 import time
 import traceback
 import warnings
@@ -176,23 +178,89 @@ class LiveStatus:
 
     SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
-    def __init__(self, enabled: bool = True, refresh_interval: float = 0.25, stream: Any | None = None) -> None:
+    def __init__(self, enabled: bool = True, refresh_interval: float = 0.2, stream: Any | None = None) -> None:
         self.stream = stream or sys.stdout
         self.enabled = bool(enabled and getattr(self.stream, "isatty", lambda: False)())
         self.refresh_interval = refresh_interval
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.state: dict[str, Any] = {}
         self._spinner_index = 0
-        self._last_render = 0.0
-        self._last_len = 0
+        self._has_running_line = False
 
-    def _write_line(self, text: str) -> None:
+    @staticmethod
+    def shorten_name(name: str, max_len: int = 45) -> str:
+        if len(name) <= max_len:
+            return name
+        return name[:20] + "..." + name[-20:]
+
+    def _terminal_width(self) -> int:
+        return max(20, shutil.get_terminal_size((120, 20)).columns)
+
+    def _truncate(self, line: str) -> str:
+        max_width = self._terminal_width() - 1
+        if len(line) <= max_width:
+            return line
+        return line[:max_width]
+
+    def _write_running_line(self, line: str) -> None:
+        line = self._truncate(line)
+        self.stream.write("\r\033[K" + line)
+        self.stream.flush()
+        self._has_running_line = True
+
+    def _write_final_line(self, line: str) -> None:
+        line = self._truncate(line)
         if self.enabled:
-            padding = " " * max(0, self._last_len - len(text))
-            self.stream.write("\r" + text + padding)
-            self.stream.flush()
-            self._last_len = len(text)
+            self.stream.write("\r\033[K" + line + "\n")
         else:
-            self.stream.write(text + "\n")
-            self.stream.flush()
+            self.stream.write(line + "\n")
+        self.stream.flush()
+        self._has_running_line = False
+
+    def start(self) -> None:
+        if not self.enabled or self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self._render_loop, name="LiveStatus", daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        if self.thread is not None:
+            self.stop_event.set()
+            self.thread.join(timeout=1.0)
+            self.thread = None
+        if self.enabled and self._has_running_line:
+            with self.lock:
+                self.stream.write("\r\033[K")
+                self.stream.flush()
+                self._has_running_line = False
+
+    def _render_loop(self) -> None:
+        while not self.stop_event.wait(self.refresh_interval):
+            with self.lock:
+                if not self.state:
+                    continue
+                line = self._format_running_line_locked()
+                self._write_running_line(line)
+
+    def _format_running_line_locked(self) -> str:
+        spinner = self.SPINNER[self._spinner_index % len(self.SPINNER)]
+        self._spinner_index += 1
+        start_time = self.state.get("start_time")
+        elapsed = (datetime.now() - start_time).total_seconds() if start_time else 0.0
+        tile_current = self.state.get("tile_current") or 0
+        tile_total = self.state.get("tile_total")
+        eta: float | None = None
+        if tile_current and tile_total and tile_total > 0 and tile_current > 0:
+            eta = (elapsed / tile_current) * max(0, tile_total - tile_current)
+        tile_text = f"{tile_current}/{tile_total if tile_total is not None else '?'}"
+        start_text = start_time.strftime("%H:%M:%S") if start_time else "--:--:--"
+        sample = self.shorten_name(str(self.state.get("sample", "")))
+        return (
+            f"{spinner} {self.state.get('status', 'running')} | {sample} | step={self.state.get('step', 'running')} | "
+            f"tile={tile_text} | start={start_text} | elapsed={format_status_seconds(elapsed)} | eta={format_status_seconds(eta)}"
+        )
 
     def update(
         self,
@@ -206,23 +274,17 @@ class LiveStatus:
     ) -> None:
         if not self.enabled:
             return
-        now = time.monotonic()
-        if not force and now - self._last_render < self.refresh_interval:
-            return
-        self._last_render = now
-        spinner = self.SPINNER[self._spinner_index % len(self.SPINNER)]
-        self._spinner_index += 1
-        elapsed = (datetime.now() - start_time).total_seconds() if start_time else 0.0
-        eta: float | None = None
-        if tile_current and tile_total and tile_total > 0 and tile_current > 0:
-            eta = (elapsed / tile_current) * max(0, tile_total - tile_current)
-        tile_text = f"{tile_current or 0}/{tile_total if tile_total is not None else '?'}"
-        start_text = start_time.strftime("%H:%M:%S") if start_time else "--:--:--"
-        line = (
-            f"{spinner} {status} | {sample} | step={step} | tile={tile_text} | "
-            f"start={start_text} | elapsed={format_status_seconds(elapsed)} | eta={format_status_seconds(eta)}"
-        )
-        self._write_line(line)
+        with self.lock:
+            self.state = {
+                "sample": sample,
+                "status": status,
+                "step": step,
+                "tile_current": tile_current,
+                "tile_total": tile_total,
+                "start_time": start_time,
+            }
+            if force:
+                self._write_running_line(self._format_running_line_locked())
 
     def finish(
         self,
@@ -233,27 +295,27 @@ class LiveStatus:
         tile_total: int | None = None,
         message: str = "",
     ) -> None:
-        if self.enabled and self._last_len:
-            self.stream.write("\r" + (" " * self._last_len) + "\r")
-            self.stream.flush()
-            self._last_len = 0
         elapsed = (datetime.now() - start_time).total_seconds() if start_time else None
+        display_sample = self.shorten_name(sample)
         if status == "done":
             prefix = "✓ done"
-            parts = [prefix, sample]
+            parts = [prefix, display_sample]
             if tile_total is not None:
                 parts.append(f"tiles={tile_current or 0}/{tile_total}")
             parts.append(f"elapsed={format_status_seconds(elapsed)}")
             if message:
                 parts.append(message)
         elif status == "failed":
-            parts = ["✗ failed", sample, f"elapsed={format_status_seconds(elapsed)}", f"error={message}"]
+            parts = ["✗ failed", display_sample, f"elapsed={format_status_seconds(elapsed)}", f"error={message}"]
         elif status == "skipped":
-            parts = ["- skipped", sample, message]
+            parts = ["- skipped", display_sample, message]
         else:
-            parts = [status, sample, message]
-        self.stream.write(" | ".join(part for part in parts if part) + "\n")
-        self.stream.flush()
+            parts = [status, display_sample, message]
+        line = " | ".join(part for part in parts if part)
+        with self.lock:
+            if self.enabled:
+                self.state = {}
+            self._write_final_line(line)
 
 
 @contextlib.contextmanager
@@ -785,6 +847,7 @@ def run(args: argparse.Namespace) -> int:
     logger, log_path = setup_logging(log_dir, args.log_level, verbose_terminal=args.verbose_terminal and args.no_live_status)
     logging.captureWarnings(True)
     live_status = LiveStatus(enabled=not args.no_live_status and not args.verbose_terminal)
+    live_status.start()
     started = time.time()
     batch_started_at = datetime.now()
     logger.info("Log file: %s", log_path)
@@ -842,6 +905,7 @@ def run(args: argparse.Namespace) -> int:
         print_completion(total_result_folders, len(tasks), rows, time.time() - started)
         print(f"summary csv: {csv_path}")
         print(f"summary json: {json_path}")
+        live_status.close()
         return 0
 
     tasks_requiring_cellpose = [task for task in tasks if task_needs_cellpose(task, args.overwrite)]
@@ -871,6 +935,7 @@ def run(args: argparse.Namespace) -> int:
             print_completion(total_result_folders, len(tasks), rows, time.time() - started)
             print(f"summary csv: {csv_path}")
             print(f"summary json: {json_path}")
+            live_status.close()
             return 1
 
     worker_count = max(1, int(args.gpu_workers if args.gpu else args.workers))
@@ -916,6 +981,7 @@ def run(args: argparse.Namespace) -> int:
     print_completion(total_result_folders, len(tasks), rows, elapsed)
     print(f"summary csv: {csv_path}")
     print(f"summary json: {json_path}")
+    live_status.close()
     return 1 if any(row.status == "failed" for row in rows) else 0
 
 
