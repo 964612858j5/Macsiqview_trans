@@ -178,7 +178,7 @@ class LiveStatus:
 
     SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
-    def __init__(self, enabled: bool = True, refresh_interval: float = 0.2, stream: Any | None = None) -> None:
+    def __init__(self, enabled: bool = True, refresh_interval: float = 0.15, stream: Any | None = None) -> None:
         self.stream = stream or sys.stdout
         self.enabled = bool(enabled and getattr(self.stream, "isatty", lambda: False)())
         self.refresh_interval = refresh_interval
@@ -251,15 +251,18 @@ class LiveStatus:
         elapsed = (datetime.now() - start_time).total_seconds() if start_time else 0.0
         tile_current = self.state.get("tile_current") or 0
         tile_total = self.state.get("tile_total")
-        eta: float | None = None
-        if tile_current and tile_total and tile_total > 0 and tile_current > 0:
+        eta_text = "--:--"
+        if self.state.get("step") == "cellpose nuclei" and tile_total and tile_total > 0 and tile_current < 1:
+            eta_text = "warming-up"
+        elif tile_total and tile_total > 0 and tile_current >= 1 and elapsed > 0:
             eta = (elapsed / tile_current) * max(0, tile_total - tile_current)
+            eta_text = format_status_seconds(eta)
         tile_text = f"{tile_current}/{tile_total if tile_total is not None else '?'}"
         start_text = start_time.strftime("%H:%M:%S") if start_time else "--:--:--"
         sample = self.shorten_name(str(self.state.get("sample", "")))
         return (
             f"{spinner} {self.state.get('status', 'running')} | {sample} | step={self.state.get('step', 'running')} | "
-            f"tile={tile_text} | start={start_text} | elapsed={format_status_seconds(elapsed)} | eta={format_status_seconds(eta)}"
+            f"tile={tile_text} | start={start_text} | elapsed={format_status_seconds(elapsed)} | eta={eta_text}"
         )
 
     def update(
@@ -671,7 +674,7 @@ def run_one_task(
             logger.info("MacsIQView mask missing")
             logger.info("entering conversion-only mode")
             if live_status:
-                live_status.update(sample_name, "running", "converting_macsiqview", 0, None, sample_started_at, force=True)
+                live_status.update(sample_name, "running", "converting macsiqview", 0, None, sample_started_at, force=True)
             with quiet_third_party(log_path or Path("/dev/null"), args.quiet_third_party):
                 convert_label_mask_to_macsiqview(task.nuclei_mask_path, task.macsiqview_mask_path)
             row.status = "success"
@@ -710,7 +713,7 @@ def run_one_task(
                         elif total_tiles > 0 and done_tiles >= total_tiles:
                             step = "saving_mask"
                         else:
-                            step = "cellpose"
+                            step = "cellpose nuclei"
                         live_status.update(sample_name, "running", step, done_tiles, total_tiles, sample_started_at)
 
                 with quiet_third_party(log_path or Path("/dev/null"), args.quiet_third_party):
@@ -734,7 +737,7 @@ def run_one_task(
                     live_status.update(
                         sample_name,
                         "running",
-                        "converting_macsiqview",
+                        "converting macsiqview",
                         int(tile_progress["current"] or 0),
                         tile_progress["total"],
                         sample_started_at,

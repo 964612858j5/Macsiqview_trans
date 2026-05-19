@@ -62,7 +62,7 @@ Summary statuses include `success`, `already_done`, `missing_background`, `missi
 By default, the terminal uses a clean single-line live status when running in an interactive terminal:
 
 ```text
-⠋ running | EXP_..._staged | step=cellpose | tile=12/48 | start=14:32:08 | elapsed=02:15 | eta=06:40
+⠋ running | EXP_..._staged | step=cellpose nuclei | tile=12/48 | start=14:32:08 | elapsed=02:15 | eta=06:40
 ```
 
 Each task then prints one final line such as `✓ done`, `✗ failed`, or `- skipped`. Third-party stdout/stderr and Python warnings are redirected to the batch log by default.
