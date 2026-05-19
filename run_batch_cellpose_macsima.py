@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import gc
 import json
@@ -11,10 +12,11 @@ import logging
 import sys
 import time
 import traceback
+import warnings
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -144,11 +146,128 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-channel-zero-fallback", action="store_true", help="Use channel 0 if DAPI/nuclei cannot be detected.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--verbose-terminal", action="store_true", help="Also print detailed logs to terminal.")
+    parser.add_argument("--no-live-status", action="store_true", help="Disable the dynamic one-line terminal status.")
+    parser.add_argument(
+        "--quiet-third-party",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Redirect third-party stdout/stderr and warnings to the log file. Default: enabled.",
+    )
     return parser
 
 
 def iso_now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def format_status_seconds(seconds: float | None) -> str:
+    """Format a short elapsed or ETA value for terminal status."""
+
+    if seconds is None or seconds < 0:
+        return "--:--"
+    total = int(seconds)
+    if total < 3600:
+        return f"{total // 60:02d}:{total % 60:02d}"
+    return str(timedelta(seconds=total))
+
+
+class LiveStatus:
+    """Small pure-Python single-line terminal status renderer."""
+
+    SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def __init__(self, enabled: bool = True, refresh_interval: float = 0.25, stream: Any | None = None) -> None:
+        self.stream = stream or sys.stdout
+        self.enabled = bool(enabled and getattr(self.stream, "isatty", lambda: False)())
+        self.refresh_interval = refresh_interval
+        self._spinner_index = 0
+        self._last_render = 0.0
+        self._last_len = 0
+
+    def _write_line(self, text: str) -> None:
+        if self.enabled:
+            padding = " " * max(0, self._last_len - len(text))
+            self.stream.write("\r" + text + padding)
+            self.stream.flush()
+            self._last_len = len(text)
+        else:
+            self.stream.write(text + "\n")
+            self.stream.flush()
+
+    def update(
+        self,
+        sample: str,
+        status: str,
+        step: str,
+        tile_current: int | None = None,
+        tile_total: int | None = None,
+        start_time: datetime | None = None,
+        force: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_render < self.refresh_interval:
+            return
+        self._last_render = now
+        spinner = self.SPINNER[self._spinner_index % len(self.SPINNER)]
+        self._spinner_index += 1
+        elapsed = (datetime.now() - start_time).total_seconds() if start_time else 0.0
+        eta: float | None = None
+        if tile_current and tile_total and tile_total > 0 and tile_current > 0:
+            eta = (elapsed / tile_current) * max(0, tile_total - tile_current)
+        tile_text = f"{tile_current or 0}/{tile_total if tile_total is not None else '?'}"
+        start_text = start_time.strftime("%H:%M:%S") if start_time else "--:--:--"
+        line = (
+            f"{spinner} {status} | {sample} | step={step} | tile={tile_text} | "
+            f"start={start_text} | elapsed={format_status_seconds(elapsed)} | eta={format_status_seconds(eta)}"
+        )
+        self._write_line(line)
+
+    def finish(
+        self,
+        sample: str,
+        status: str,
+        start_time: datetime | None = None,
+        tile_current: int | None = None,
+        tile_total: int | None = None,
+        message: str = "",
+    ) -> None:
+        if self.enabled and self._last_len:
+            self.stream.write("\r" + (" " * self._last_len) + "\r")
+            self.stream.flush()
+            self._last_len = 0
+        elapsed = (datetime.now() - start_time).total_seconds() if start_time else None
+        if status == "done":
+            prefix = "✓ done"
+            parts = [prefix, sample]
+            if tile_total is not None:
+                parts.append(f"tiles={tile_current or 0}/{tile_total}")
+            parts.append(f"elapsed={format_status_seconds(elapsed)}")
+            if message:
+                parts.append(message)
+        elif status == "failed":
+            parts = ["✗ failed", sample, f"elapsed={format_status_seconds(elapsed)}", f"error={message}"]
+        elif status == "skipped":
+            parts = ["- skipped", sample, message]
+        else:
+            parts = [status, sample, message]
+        self.stream.write(" | ".join(part for part in parts if part) + "\n")
+        self.stream.flush()
+
+
+@contextlib.contextmanager
+def quiet_third_party(log_path: Path, enabled: bool):
+    """Redirect noisy Python stdout/stderr and warnings into the batch log."""
+
+    if not enabled:
+        yield
+        return
+    logging.captureWarnings(True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        with contextlib.redirect_stdout(handle), contextlib.redirect_stderr(handle), warnings.catch_warnings():
+            warnings.simplefilter("default")
+            yield
 
 
 def load_skip_list(skip_list_path: Path | None) -> set[str]:
@@ -429,10 +548,20 @@ def task_to_row(task: Task, status: str, skipped_reason: str = "", error_message
     )
 
 
-def run_one_task(task: Task, args: argparse.Namespace, logger: logging.Logger, device: Any) -> SummaryRow:
+def run_one_task(
+    task: Task,
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    device: Any,
+    live_status: LiveStatus | None = None,
+    log_path: Path | None = None,
+) -> SummaryRow:
     row = task_to_row(task, "failed")
     row.start_time = iso_now()
+    sample_started_at = datetime.now()
     started = time.time()
+    tile_progress = {"current": 0, "total": None}
+    sample_name = task.result_folder
     logger.info("Starting result folder: %s", task.result_folder)
     logger.info("Background folders found: %d", task.n_background_found)
     logger.info("Backsub OME-TIFFs found: %d", task.n_backsub_found)
@@ -440,6 +569,8 @@ def run_one_task(task: Task, args: argparse.Namespace, logger: logging.Logger, d
     logger.info("Final output directory: %s", task.final_output_dir)
     logger.info("Nuclei mask output: %s", task.nuclei_mask_path)
     logger.info("MacsIQView mask output: %s", task.macsiqview_mask_path)
+    if live_status:
+        live_status.update(sample_name, "running", "loading_image", 0, None, sample_started_at, force=True)
 
     try:
         pipeline_state = determine_pipeline_state(task.nuclei_mask_path, task.macsiqview_mask_path)
@@ -459,12 +590,16 @@ def run_one_task(task: Task, args: argparse.Namespace, logger: logging.Logger, d
                 task.nuclei_mask_path,
                 task.macsiqview_mask_path,
             )
+            if live_status:
+                live_status.finish(sample_name, "skipped", sample_started_at, message="reason=inconsistent_state")
             return row
 
         if pipeline_state == "skip_completed" and not args.overwrite:
             row.status = "already_done"
             row.skipped_reason = "nuclei_and_macsiqview_masks_exist"
             logger.info("Skipping completed task: nuclei=%s macsiqview=%s", task.nuclei_mask_path, task.macsiqview_mask_path)
+            if live_status:
+                live_status.finish(sample_name, "skipped", sample_started_at, message="reason=already_done")
             return row
 
         task.final_output_dir.mkdir(parents=True, exist_ok=True)
@@ -473,51 +608,92 @@ def run_one_task(task: Task, args: argparse.Namespace, logger: logging.Logger, d
             logger.info("existing nuclei mask found")
             logger.info("MacsIQView mask missing")
             logger.info("entering conversion-only mode")
-            convert_label_mask_to_macsiqview(task.nuclei_mask_path, task.macsiqview_mask_path)
+            if live_status:
+                live_status.update(sample_name, "running", "converting_macsiqview", 0, None, sample_started_at, force=True)
+            with quiet_third_party(log_path or Path("/dev/null"), args.quiet_third_party):
+                convert_label_mask_to_macsiqview(task.nuclei_mask_path, task.macsiqview_mask_path)
             row.status = "success"
             row.conversion_only = True
             row.nuclei_mask_exists = True
             row.macsiqview_mask_exists = task.macsiqview_mask_path.exists()
             logger.info("Conversion-only task succeeded: macsiqview=%s", task.macsiqview_mask_path)
+            if live_status:
+                live_status.finish(sample_name, "done", sample_started_at, message=f"output={task.macsiqview_mask_path}")
             return row
 
         if args.overwrite:
             logger.info("Overwrite enabled. Running full Cellpose + conversion pipeline from pipeline_state=%s.", pipeline_state)
 
-        segmenter = V7NucleiSegmenter(
-            device=device,
-            logger=logger,
-            model_type=args.model_type,
-            diameter=None if args.diameter == 0 else args.diameter,
-            cellprob_threshold=args.cellprob_threshold,
-            flow_threshold=args.flow_threshold,
-            gpu=args.gpu,
-        )
+        if live_status:
+            live_status.update(sample_name, "running", "loading_image", 0, None, sample_started_at, force=True)
+        with quiet_third_party(log_path or Path("/dev/null"), args.quiet_third_party):
+            segmenter = V7NucleiSegmenter(
+                device=device,
+                logger=logger,
+                model_type=args.model_type,
+                diameter=None if args.diameter == 0 else args.diameter,
+                cellprob_threshold=args.cellprob_threshold,
+                flow_threshold=args.flow_threshold,
+                gpu=args.gpu,
+            )
         last_error: BaseException | None = None
         for attempt_tile_size, attempt_overlap in fallback_sequence(args.tile_size, args.overlap):
             try:
-                run_v7_like_segmentation(
-                    sample_id=task.input_backsub_ome_tif.stem,
-                    input_tiff=task.input_backsub_ome_tif,
-                    markers_csv=markers_csv_for_task(task),
-                    label_output=task.nuclei_mask_path,
-                    macsiqview_output=None,
-                    segmenter=segmenter,
-                    logger=logger,
-                    progress_callback=lambda _done, _total: None,
-                    n_rows=args.n_rows,
-                    n_cols=args.n_cols,
-                    tile_size=attempt_tile_size,
-                    overlap_px=attempt_overlap,
-                    nuclear_channel=args.nuclear_channel,
-                    require_detected_nuclear_channel=not args.allow_channel_zero_fallback,
-                )
-                convert_label_mask_to_macsiqview(task.nuclei_mask_path, task.macsiqview_mask_path)
+                def update_tile_progress(done_tiles: int, total_tiles: int) -> None:
+                    tile_progress["current"] = done_tiles
+                    tile_progress["total"] = total_tiles
+                    if live_status:
+                        if done_tiles == 0:
+                            step = "tiling"
+                        elif total_tiles > 0 and done_tiles >= total_tiles:
+                            step = "saving_mask"
+                        else:
+                            step = "cellpose"
+                        live_status.update(sample_name, "running", step, done_tiles, total_tiles, sample_started_at)
+
+                with quiet_third_party(log_path or Path("/dev/null"), args.quiet_third_party):
+                    run_v7_like_segmentation(
+                        sample_id=task.input_backsub_ome_tif.stem,
+                        input_tiff=task.input_backsub_ome_tif,
+                        markers_csv=markers_csv_for_task(task),
+                        label_output=task.nuclei_mask_path,
+                        macsiqview_output=None,
+                        segmenter=segmenter,
+                        logger=logger,
+                        progress_callback=update_tile_progress,
+                        n_rows=args.n_rows,
+                        n_cols=args.n_cols,
+                        tile_size=attempt_tile_size,
+                        overlap_px=attempt_overlap,
+                        nuclear_channel=args.nuclear_channel,
+                        require_detected_nuclear_channel=not args.allow_channel_zero_fallback,
+                    )
+                if live_status:
+                    live_status.update(
+                        sample_name,
+                        "running",
+                        "converting_macsiqview",
+                        int(tile_progress["current"] or 0),
+                        tile_progress["total"],
+                        sample_started_at,
+                        force=True,
+                    )
+                with quiet_third_party(log_path or Path("/dev/null"), args.quiet_third_party):
+                    convert_label_mask_to_macsiqview(task.nuclei_mask_path, task.macsiqview_mask_path)
                 row.status = "success"
                 row.conversion_only = False
                 row.nuclei_mask_exists = task.nuclei_mask_path.exists()
                 row.macsiqview_mask_exists = task.macsiqview_mask_path.exists()
                 logger.info("Task succeeded: nuclei=%s macsiqview=%s", task.nuclei_mask_path, task.macsiqview_mask_path)
+                if live_status:
+                    live_status.finish(
+                        sample_name,
+                        "done",
+                        sample_started_at,
+                        int(tile_progress["current"] or 0),
+                        int(tile_progress["total"] or 0) if tile_progress["total"] is not None else None,
+                        message=f"output={task.macsiqview_mask_path}",
+                    )
                 return row
             except BaseException as exc:
                 last_error = exc
@@ -542,6 +718,8 @@ def run_one_task(task: Task, args: argparse.Namespace, logger: logging.Logger, d
         row.error_message = str(exc)
         logger.error("Task marked failed: input=%s error=%s", task.input_backsub_ome_tif, exc)
         logger.debug("Traceback:\n%s", traceback.format_exc())
+        if live_status:
+            live_status.finish(sample_name, "failed", sample_started_at, message=f"{exc}, see log")
         return row
     finally:
         row.end_time = iso_now()
@@ -599,9 +777,16 @@ def print_completion(total_result_folders: int, total_tasks: int, rows: list[Sum
 
 
 def run(args: argparse.Namespace) -> int:
-    project_dir = Path(__file__).resolve().parent
-    logger, log_path = setup_logging(project_dir / "logs", args.log_level, verbose_terminal=args.verbose_terminal)
+    if not args.root.exists():
+        raise FileNotFoundError(f"Root directory does not exist: {args.root}")
+    if not args.root.is_dir():
+        raise NotADirectoryError(f"Root path is not a directory: {args.root}")
+    log_dir = summary_root_for_run(args) / "logs"
+    logger, log_path = setup_logging(log_dir, args.log_level, verbose_terminal=args.verbose_terminal and args.no_live_status)
+    logging.captureWarnings(True)
+    live_status = LiveStatus(enabled=not args.no_live_status and not args.verbose_terminal)
     started = time.time()
+    batch_started_at = datetime.now()
     logger.info("Log file: %s", log_path)
     logger.info("Root: %s", args.root)
     logger.info("Output mode: %s", args.output_mode)
@@ -611,7 +796,10 @@ def run(args: argparse.Namespace) -> int:
     logger.info("Model type: %s", args.model_type)
     logger.info("Cellpose params: diameter=%s cellprob_threshold=%.3f flow_threshold=%.3f", args.diameter, args.cellprob_threshold, args.flow_threshold)
     logger.info("Execution: gpu=%s workers=%d gpu_workers=%d dry_run=%s overwrite=%s", args.gpu, args.workers, args.gpu_workers, args.dry_run, args.overwrite)
+    logger.info("Live status enabled: %s", live_status.enabled)
+    logger.info("Quiet third-party output: %s", args.quiet_third_party)
 
+    live_status.update("batch", "running", "discovering", 0, None, datetime.now(), force=True)
     skip_set = load_skip_list(args.skip_list)
     logger.info("Skip-list entries loaded: %d", len(skip_set))
     tasks, missing_rows, total_result_folders = discover_macsima_backsub_images_with_status(
@@ -631,6 +819,8 @@ def run(args: argparse.Namespace) -> int:
             row.n_background_found,
             row.n_backsub_found,
         )
+        if row.status == "skipped_by_user":
+            live_status.finish(row.result_folder, "skipped", message="reason=in_skip_list")
 
     rows: list[SummaryRow] = list(missing_rows)
     if args.dry_run:
@@ -648,6 +838,7 @@ def run(args: argparse.Namespace) -> int:
         csv_path, json_path = write_summary(summary_root_for_run(args), rows)
         logger.info("Summary CSV: %s", csv_path)
         logger.info("Summary JSON: %s", json_path)
+        live_status.finish("batch", "done", batch_started_at, message="dry-run")
         print_completion(total_result_folders, len(tasks), rows, time.time() - started)
         print(f"summary csv: {csv_path}")
         print(f"summary json: {json_path}")
@@ -659,8 +850,9 @@ def run(args: argparse.Namespace) -> int:
     device: Any = None
     if args.gpu and tasks_requiring_cellpose:
         try:
-            require_gpu(logger)
-            import torch
+            with quiet_third_party(log_path, args.quiet_third_party):
+                require_gpu(logger)
+                import torch
 
             device = torch.device("cuda")
         except Exception as exc:
@@ -674,7 +866,7 @@ def run(args: argparse.Namespace) -> int:
             for task in tasks:
                 if task in tasks_requiring_cellpose:
                     continue
-                rows.append(run_one_task(task, args, logger, device))
+                rows.append(run_one_task(task, args, logger, device, live_status, log_path))
             csv_path, json_path = write_summary(summary_root_for_run(args), rows)
             print_completion(total_result_folders, len(tasks), rows, time.time() - started)
             print(f"summary csv: {csv_path}")
@@ -688,14 +880,23 @@ def run(args: argparse.Namespace) -> int:
 
     if worker_count == 1:
         for task in tasks:
-            rows.append(run_one_task(task, args, logger, device))
+            rows.append(run_one_task(task, args, logger, device, live_status, log_path))
     else:
+        if live_status.enabled:
+            logger.info("Dynamic live status is disabled for parallel worker mode.")
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_to_task = {executor.submit(run_one_task, task, args, logger, device): task for task in tasks}
+            future_to_task = {executor.submit(run_one_task, task, args, logger, device, None, log_path): task for task in tasks}
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
                 try:
-                    rows.append(future.result())
+                    row = future.result()
+                    rows.append(row)
+                    if row.status == "already_done":
+                        live_status.finish(row.result_folder, "skipped", message="reason=already_done")
+                    elif row.status == "success":
+                        live_status.finish(row.result_folder, "done", message=f"output={row.macsiqview_mask_path}")
+                    elif row.status == "inconsistent_state":
+                        live_status.finish(row.result_folder, "skipped", message="reason=inconsistent_state")
                 except Exception as exc:
                     logger.error("Unhandled task failure input=%s error=%s", task.input_backsub_ome_tif, exc)
                     logger.debug("Traceback:\n%s", traceback.format_exc())
@@ -703,12 +904,15 @@ def run(args: argparse.Namespace) -> int:
                     row.start_time = iso_now()
                     row.end_time = row.start_time
                     rows.append(row)
+                    live_status.finish(task.result_folder, "failed", message=f"{exc}, see log")
 
+    live_status.update("batch", "running", "writing_summary", 0, None, datetime.now(), force=True)
     csv_path, json_path = write_summary(summary_root_for_run(args), rows)
     write_per_result_summaries(rows)
     elapsed = time.time() - started
     logger.info("Summary CSV: %s", csv_path)
     logger.info("Summary JSON: %s", json_path)
+    live_status.finish("batch", "done", batch_started_at, message=f"summary={csv_path}")
     print_completion(total_result_folders, len(tasks), rows, elapsed)
     print(f"summary csv: {csv_path}")
     print(f"summary json: {json_path}")

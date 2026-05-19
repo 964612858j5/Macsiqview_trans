@@ -57,6 +57,38 @@ In centralized mode, the global summary is written to `--central-output-dir`. In
 
 Summary statuses include `success`, `already_done`, `missing_background`, `missing_backsub_ome_tif`, `failed`, and `dry_run`.
 
+## Terminal And Logs
+
+By default, the terminal uses a clean single-line live status when running in an interactive terminal:
+
+```text
+⠋ running | EXP_..._staged | step=cellpose | tile=12/48 | start=14:32:08 | elapsed=02:15 | eta=06:40
+```
+
+Each task then prints one final line such as `✓ done`, `✗ failed`, or `- skipped`. Third-party stdout/stderr and Python warnings are redirected to the batch log by default.
+
+Log files are written under:
+
+```text
+<central_output_dir>/logs/
+```
+
+for centralized output, or:
+
+```text
+<root>/logs/
+```
+
+for per-result-folder output.
+
+Useful display flags:
+
+```bash
+--no-live-status
+--quiet-third-party
+--no-quiet-third-party
+```
+
 ## Default CRC Run
 
 ```bash
