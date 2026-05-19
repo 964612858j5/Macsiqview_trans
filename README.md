@@ -97,7 +97,14 @@ python run_batch_cellpose_macsima.py \
 
 ## Overwrite Existing Masks
 
-The skip check uses the final MacsIQView mask. If `*_cellpose_nuclei_mask_MacsIQView.tif` exists, the task is marked `already_done` unless `--overwrite` is provided.
+The pipeline supports resume with four output states:
+
+- No nuclei mask and no MacsIQView mask: run full Cellpose segmentation and conversion.
+- Nuclei mask exists but MacsIQView mask is missing: run conversion-only mode and do not rerun Cellpose.
+- Both masks exist: mark `already_done` and skip unless `--overwrite` is provided.
+- MacsIQView mask exists but nuclei mask is missing: mark `inconsistent_state`, log a warning, and skip by default.
+
+The summary records `pipeline_state`, `conversion_only`, `nuclei_mask_exists`, and `macsiqview_mask_exists`.
 
 ```bash
 python run_batch_cellpose_macsima.py \

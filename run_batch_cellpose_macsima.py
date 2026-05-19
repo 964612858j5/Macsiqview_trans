@@ -42,6 +42,10 @@ SUMMARY_FIELDS = (
     "final_output_dir",
     "nuclei_mask_path",
     "macsiqview_mask_path",
+    "pipeline_state",
+    "conversion_only",
+    "nuclei_mask_exists",
+    "macsiqview_mask_exists",
     "status",
     "n_background_found",
     "n_backsub_found",
@@ -87,6 +91,10 @@ class SummaryRow:
     status: str
     n_background_found: int
     n_backsub_found: int
+    pipeline_state: str = ""
+    conversion_only: bool = False
+    nuclei_mask_exists: bool = False
+    macsiqview_mask_exists: bool = False
     skipped_reason: str = ""
     error_message: str = ""
     start_time: str = ""
@@ -183,6 +191,28 @@ def resolve_output_paths(
     if output_root is None:
         raise ValueError("Could not resolve output root.")
     return final_output_dir, nuclei_mask_path, macsiqview_mask_path, output_root
+
+
+def determine_pipeline_state(nuclei_mask_path: Path, macsiqview_mask_path: Path) -> str:
+    """Return the resume state from existing nuclei and MacsIQView outputs."""
+
+    nuclei_exists = nuclei_mask_path.exists()
+    macsiqview_exists = macsiqview_mask_path.exists()
+    if not nuclei_exists and not macsiqview_exists:
+        return "run_full_pipeline"
+    if nuclei_exists and not macsiqview_exists:
+        return "run_conversion_only"
+    if nuclei_exists and macsiqview_exists:
+        return "skip_completed"
+    return "inconsistent_state"
+
+
+def task_needs_cellpose(task: Task, overwrite: bool) -> bool:
+    """Return whether this task needs Cellpose segmentation in this run."""
+
+    if overwrite:
+        return True
+    return determine_pipeline_state(task.nuclei_mask_path, task.macsiqview_mask_path) == "run_full_pipeline"
 
 
 def discover_macsima_backsub_images(
@@ -320,6 +350,9 @@ def fallback_sequence(tile_size: int | None, overlap: int) -> list[tuple[int | N
 
 
 def task_to_row(task: Task, status: str, skipped_reason: str = "", error_message: str = "") -> SummaryRow:
+    pipeline_state = determine_pipeline_state(task.nuclei_mask_path, task.macsiqview_mask_path)
+    nuclei_exists = task.nuclei_mask_path.exists()
+    macsiqview_exists = task.macsiqview_mask_path.exists()
     return SummaryRow(
         result_folder=task.result_folder,
         result_folder_path=str(task.result_folder_path),
@@ -334,6 +367,10 @@ def task_to_row(task: Task, status: str, skipped_reason: str = "", error_message
         status=status,
         n_background_found=task.n_background_found,
         n_backsub_found=task.n_backsub_found,
+        pipeline_state=pipeline_state,
+        conversion_only=pipeline_state == "run_conversion_only",
+        nuclei_mask_exists=nuclei_exists,
+        macsiqview_mask_exists=macsiqview_exists,
         skipped_reason=skipped_reason,
         error_message=error_message,
     )
@@ -352,13 +389,48 @@ def run_one_task(task: Task, args: argparse.Namespace, logger: logging.Logger, d
     logger.info("MacsIQView mask output: %s", task.macsiqview_mask_path)
 
     try:
-        if task.macsiqview_mask_path.exists() and not args.overwrite:
+        pipeline_state = determine_pipeline_state(task.nuclei_mask_path, task.macsiqview_mask_path)
+        row.pipeline_state = pipeline_state
+        row.conversion_only = pipeline_state == "run_conversion_only" and not args.overwrite
+        row.nuclei_mask_exists = task.nuclei_mask_path.exists()
+        row.macsiqview_mask_exists = task.macsiqview_mask_path.exists()
+        logger.info("existing nuclei mask found: %s", row.nuclei_mask_exists)
+        logger.info("MacsIQView mask exists: %s", row.macsiqview_mask_exists)
+        logger.info("pipeline_state: %s", pipeline_state)
+
+        if pipeline_state == "inconsistent_state" and not args.overwrite:
+            row.status = "inconsistent_state"
+            row.skipped_reason = "macsiqview_exists_but_nuclei_missing"
+            logger.warning(
+                "inconsistent_state: MacsIQView mask exists but nuclei mask is missing. Skipping without deleting files. nuclei=%s macsiqview=%s",
+                task.nuclei_mask_path,
+                task.macsiqview_mask_path,
+            )
+            return row
+
+        if pipeline_state == "skip_completed" and not args.overwrite:
             row.status = "already_done"
-            row.skipped_reason = "macsiqview_mask_exists"
-            logger.info("Skipping existing MacsIQView output mask: %s", task.macsiqview_mask_path)
+            row.skipped_reason = "nuclei_and_macsiqview_masks_exist"
+            logger.info("Skipping completed task: nuclei=%s macsiqview=%s", task.nuclei_mask_path, task.macsiqview_mask_path)
             return row
 
         task.final_output_dir.mkdir(parents=True, exist_ok=True)
+
+        if pipeline_state == "run_conversion_only" and not args.overwrite:
+            logger.info("existing nuclei mask found")
+            logger.info("MacsIQView mask missing")
+            logger.info("entering conversion-only mode")
+            convert_label_mask_to_macsiqview(task.nuclei_mask_path, task.macsiqview_mask_path)
+            row.status = "success"
+            row.conversion_only = True
+            row.nuclei_mask_exists = True
+            row.macsiqview_mask_exists = task.macsiqview_mask_path.exists()
+            logger.info("Conversion-only task succeeded: macsiqview=%s", task.macsiqview_mask_path)
+            return row
+
+        if args.overwrite:
+            logger.info("Overwrite enabled. Running full Cellpose + conversion pipeline from pipeline_state=%s.", pipeline_state)
+
         segmenter = V7NucleiSegmenter(
             device=device,
             logger=logger,
@@ -389,6 +461,9 @@ def run_one_task(task: Task, args: argparse.Namespace, logger: logging.Logger, d
                 )
                 convert_label_mask_to_macsiqview(task.nuclei_mask_path, task.macsiqview_mask_path)
                 row.status = "success"
+                row.conversion_only = False
+                row.nuclei_mask_exists = task.nuclei_mask_path.exists()
+                row.macsiqview_mask_exists = task.macsiqview_mask_path.exists()
                 logger.info("Task succeeded: nuclei=%s macsiqview=%s", task.nuclei_mask_path, task.macsiqview_mask_path)
                 return row
             except BaseException as exc:
@@ -462,6 +537,8 @@ def print_completion(total_result_folders: int, total_tasks: int, rows: list[Sum
     print(f"already_done: {counts.get('already_done', 0)}")
     print(f"missing_background: {counts.get('missing_background', 0)}")
     print(f"missing_backsub_ome_tif: {counts.get('missing_backsub_ome_tif', 0)}")
+    print(f"inconsistent_state: {counts.get('inconsistent_state', 0)}")
+    print(f"conversion_only: {sum(1 for row in rows if row.conversion_only)}")
     print(f"failed: {counts.get('failed', 0)}")
     print(f"dry_run: {counts.get('dry_run', 0)}")
     print(f"total runtime: {format_seconds(elapsed)}")
@@ -518,8 +595,11 @@ def run(args: argparse.Namespace) -> int:
         print(f"summary json: {json_path}")
         return 0
 
+    tasks_requiring_cellpose = [task for task in tasks if task_needs_cellpose(task, args.overwrite)]
+    logger.info("Tasks requiring Cellpose segmentation in this run: %d", len(tasks_requiring_cellpose))
+
     device: Any = None
-    if args.gpu:
+    if args.gpu and tasks_requiring_cellpose:
         try:
             require_gpu(logger)
             import torch
@@ -528,11 +608,15 @@ def run(args: argparse.Namespace) -> int:
         except Exception as exc:
             logger.error("GPU validation failed: %s", exc)
             logger.debug("Traceback:\n%s", traceback.format_exc())
-            for task in tasks:
+            for task in tasks_requiring_cellpose:
                 row = task_to_row(task, "failed", error_message=str(exc))
                 row.start_time = iso_now()
                 row.end_time = row.start_time
                 rows.append(row)
+            for task in tasks:
+                if task in tasks_requiring_cellpose:
+                    continue
+                rows.append(run_one_task(task, args, logger, device))
             csv_path, json_path = write_summary(summary_root_for_run(args), rows)
             print_completion(total_result_folders, len(tasks), rows, time.time() - started)
             print(f"summary csv: {csv_path}")
